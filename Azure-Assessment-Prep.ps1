@@ -266,6 +266,10 @@ function Invoke-Option2_InstallModules {
         'Az.Dns',
         'Az.PrivateDns',
         'Az.Billing',
+        'Az.Reservations',
+        'Az.Websites',
+        'Az.PostgreSql',
+        'Az.MySql',
         'Microsoft.Graph.Users',
         'Microsoft.Graph.Identity.SignIns',
         'Microsoft.Graph.Applications'

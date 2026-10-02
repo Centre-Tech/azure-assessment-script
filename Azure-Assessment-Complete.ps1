@@ -25,6 +25,12 @@
 
 .PARAMETER DaysBack
     Optional. Number of days to look back for metrics. Default 30.
+
+.PARAMETER CostMonths
+    Optional. Number of months of actual cost (Cost Management) to collect, including the current month. Default 3.
+
+.PARAMETER SectionTimeoutSeconds
+    Optional. Time budget for long-running queries (Resource Graph paging, file share enumeration). Default 300.
 #>
 
 [CmdletBinding()]
@@ -36,10 +42,13 @@ param(
     [string[]]$SubscriptionInclude,
     [string[]]$SubscriptionExclude,
     [int]$MaxRetries = 3,
-    [switch]$FailOnSectionError
+    [switch]$FailOnSectionError,
+    [int]$CostMonths = 3,
+    [int]$SectionTimeoutSeconds = 300
 )
 
 #region ── Setup ──────────────────────────────────────────────────────────────
+$ScriptVersion = '2026.10.0'
 $ErrorActionPreference = 'Continue'
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmm'
 if (-not $OutputPath) { $OutputPath = "./AzureAssessment_$timestamp" }
@@ -53,11 +62,45 @@ $startTime = Get-Date
 $endTime = Get-Date
 $metricsStart = (Get-Date).AddDays(-$DaysBack)
 
-# Summary collector
+# Summary collector (manifest of exported files)
 $summaryData = [System.Collections.ArrayList]::new()
+
+# Section error/timing tracking
+$sectionErrors  = [System.Collections.ArrayList]::new()
+$sectionTimings = [System.Collections.ArrayList]::new()
+$script:currentSection = $null
+$script:sectionStart   = $null
+$script:currentSubName = $null
+
+# Datasets that could not be (fully) collected: FileName -> reason.
+# A dataset with rows and a note is 'Partial'; with no rows it is 'NotCollected' and no file is written.
+$script:datasetNotes = @{}
+
+function Set-NotCollected {
+    param([string]$Dataset, [string]$Reason)
+    if (-not $Dataset) { return }
+    $existing = $script:datasetNotes[$Dataset]
+    if (-not $existing) { $script:datasetNotes[$Dataset] = $Reason }
+    elseif ($existing -notlike "*$Reason*") { $script:datasetNotes[$Dataset] = "$existing; $Reason" }
+}
+
+function Complete-SectionTiming {
+    if ($script:currentSection -and $script:sectionStart) {
+        $null = $sectionTimings.Add([PSCustomObject]@{
+            Subscription = $script:currentSubName
+            Section      = $script:currentSection
+            Seconds      = [math]::Round(((Get-Date) - $script:sectionStart).TotalSeconds, 1)
+        })
+    }
+    $script:currentSection = $null
+    $script:sectionStart   = $null
+}
 
 function Write-Section {
     param([string]$Title)
+    Complete-SectionTiming
+    $script:currentSection = $Title
+    $script:sectionStart   = Get-Date
     Write-Host "`n╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host "║  $Title" -ForegroundColor Cyan
     Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
@@ -68,17 +111,56 @@ function Write-SubSection {
     Write-Host "  ► $Title" -ForegroundColor Yellow
 }
 
-function Export-SafeCsv {
-    param($Data, [string]$FileName)
-    $path = "$OutputPath/$FileName"
-    if ($Data -and @($Data).Count -gt 0) {
-        $Data | Export-Csv $path -NoTypeInformation -Encoding UTF8
-        $count = @($Data).Count
-        Write-Host "    ✓ Exported $count rows → $FileName" -ForegroundColor Green
-        $null = $summaryData.Add([PSCustomObject]@{ File=$FileName; Rows=$count })
-    } else {
-        Write-Host "    – No data for $FileName" -ForegroundColor DarkGray
+function Write-SectionError {
+    param($ErrorRecord, [string]$Context = '', [string]$Dataset = '')
+    $where = if ($Context) { $Context }
+             elseif ($ErrorRecord.InvocationInfo) { "Line $($ErrorRecord.InvocationInfo.ScriptLineNumber)" }
+             else { 'Unknown' }
+    $msg = if ($ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { "$ErrorRecord" }
+    $null = $sectionErrors.Add([PSCustomObject]@{
+        Subscription = $script:currentSubName
+        Section      = $script:currentSection
+        Context      = $where
+        Dataset      = $Dataset
+        Error        = $msg
+    })
+    Write-Host "    ! $where : $msg" -ForegroundColor DarkYellow
+    if ($Dataset) {
+        $subLabel = if ($script:currentSubName) { "[$($script:currentSubName)] " } else { '' }
+        $short = if ($msg.Length -gt 200) { $msg.Substring(0, 200) + '...' } else { $msg }
+        Set-NotCollected -Dataset $Dataset -Reason "$subLabel$short"
     }
+}
+
+function Export-SafeCsv {
+    param($Data, [string]$FileName, [string[]]$Columns)
+    $path = Join-Path $OutputPath $FileName
+    if (-not $Columns -and $Schemas -and $Schemas.ContainsKey($FileName)) { $Columns = $Schemas[$FileName] }
+    $rows  = @($Data | Where-Object { $null -ne $_ })
+    $count = $rows.Count
+    $note  = $script:datasetNotes[$FileName]
+    if ($count -gt 0) {
+        if ($Columns) {
+            # Schema columns first in a stable order, then any extra properties
+            $extra = @($rows[0].PSObject.Properties.Name | Where-Object { $_ -notin $Columns })
+            $rows = $rows | Select-Object -Property (@($Columns) + $extra)
+        }
+        $rows | Export-Csv $path -NoTypeInformation -Encoding UTF8
+        $status = if ($note) { 'Partial' } else { 'Collected' }
+        Write-Host "    ✓ Exported $count rows → $FileName" -ForegroundColor Green
+    } elseif ($note) {
+        $status = 'NotCollected'
+        Write-Host "    ✗ Not collected: $FileName ($note)" -ForegroundColor DarkYellow
+    } else {
+        $status = 'Empty'
+        if ($Columns) {
+            # Header-only file so "nothing found" is distinguishable from "not collected"
+            $header = '"' + (($Columns | ForEach-Object { $_ -replace '"', '""' }) -join '","') + '"'
+            Set-Content -Path $path -Value $header -Encoding UTF8
+        }
+        Write-Host "    - No rows for $FileName (header only)" -ForegroundColor DarkGray
+    }
+    $null = $summaryData.Add([PSCustomObject]@{ File = $FileName; Rows = $count; Status = $status; Note = $note })
 }
 
 function Test-ModuleAvailable {
@@ -86,8 +168,70 @@ function Test-ModuleAvailable {
     return [bool](Get-Module -ListAvailable -Name $ModuleName 2>$null)
 }
 
+function Test-CommandAvailable {
+    param([string]$Name)
+    return [bool](Get-Command -Name $Name -ErrorAction SilentlyContinue)
+}
+
+# Null-safe last path segment of an ARM resource ID
+function Get-LastSegment {
+    param($Id)
+    if ($null -eq $Id) { return $null }
+    $s = "$Id".Trim().TrimEnd('/')
+    if (-not $s) { return $null }
+    return ($s -split '/')[-1]
+}
+
+# Flatten scalars, arrays and List[string] into a single delimited string
+function Join-Values {
+    param($Value, [string]$Separator = ',')
+    $flat = foreach ($v in @($Value)) {
+        if ($null -eq $v) { continue }
+        if ($v -is [string]) { $v }
+        elseif ($v -is [System.Collections.IEnumerable]) { foreach ($x in $v) { if ($null -ne $x) { "$x" } } }
+        else { "$v" }
+    }
+    $out = @($flat | Where-Object { "$_".Trim() -ne '' } | ForEach-Object { "$_".Trim() } | Select-Object -Unique)
+    return ($out -join $Separator)
+}
+
+# First argument that is not null or empty
+function Get-FirstNonEmpty {
+    foreach ($v in $args) {
+        if ($null -ne $v -and "$v" -ne '') { return $v }
+    }
+    return $null
+}
+
+# Read a (possibly dotted) property path from an object, dictionary, or AdditionalProperties bag. Case-insensitive.
+function Get-PropValue {
+    param($Object, [string[]]$Name)
+    foreach ($n in $Name) {
+        $cur = $Object
+        foreach ($seg in ($n -split '\.')) {
+            if ($null -eq $cur) { break }
+            $next = $null
+            if ($cur -is [System.Collections.IDictionary]) {
+                foreach ($k in @($cur.Keys)) { if ("$k" -ieq $seg) { $next = $cur[$k]; break } }
+            } else {
+                $p = $cur.PSObject.Properties[$seg]
+                if ($p) { $next = $p.Value }
+                if ($null -eq $next) {
+                    $ap = $cur.PSObject.Properties['AdditionalProperties']
+                    if ($ap -and $ap.Value -is [System.Collections.IDictionary]) {
+                        foreach ($k in @($ap.Value.Keys)) { if ("$k" -ieq $seg) { $next = $ap.Value[$k]; break } }
+                    }
+                }
+            }
+            $cur = $next
+        }
+        if ($null -ne $cur -and "$cur" -ne '') { return $cur }
+    }
+    return $null
+}
+
 function Get-MetricSafe {
-    param([string]$ResourceId, [string]$MetricName, [string]$Aggregation = 'Average')
+    param([string]$ResourceId, [string[]]$MetricName, [string]$Aggregation = 'Average')
     try {
         $metric = Get-AzMetric -ResourceId $ResourceId `
             -MetricName $MetricName `
@@ -116,21 +260,142 @@ function Invoke-WithRetry {
     }
 }
 
-# Section error/timing tracking
-$sectionErrors = [System.Collections.ArrayList]::new()
-$sectionTimings = [System.Collections.ArrayList]::new()
+# ARM REST call via Invoke-AzRestMethod with 429/5xx retry (honours Retry-After headers),
+# optional nextLink paging and a time budget. Returns one parsed object per page.
+$script:lastRestTruncated = $false
+function Invoke-ArmRest {
+    param(
+        [string]$Path,
+        [ValidateSet('GET','POST','PUT','PATCH','DELETE')][string]$Method = 'GET',
+        $Body,
+        [int]$TimeoutSeconds = $SectionTimeoutSeconds,
+        [switch]$FollowNextLink
+    )
+    $script:lastRestTruncated = $false
+    $deadline = (Get-Date).AddSeconds([math]::Max($TimeoutSeconds, 1))
+    $payload = $null
+    if ($null -ne $Body) { $payload = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress } }
+    $pages = [System.Collections.ArrayList]::new()
+    $next = $Path
+    while ($next) {
+        $attempt = 0
+        while ($true) {
+            $p = @{ Method = $Method; ErrorAction = 'Stop' }
+            if ($next -match '^https?://') { $p.Uri = $next } else { $p.Path = $next }
+            if ($payload) { $p.Payload = $payload }
+            $resp = Invoke-AzRestMethod @p
+            $code = [int]$resp.StatusCode
+            if ($code -ge 200 -and $code -lt 300) { break }
+            if (($code -eq 429 -or $code -ge 500) -and $attempt -lt $MaxRetries -and (Get-Date) -lt $deadline) {
+                $attempt++
+                $wait = 0
+                try {
+                    foreach ($kv in @($resp.Headers)) {
+                        if ("$($kv.Key)" -match 'retry-after$') {
+                            $n = 0
+                            if ([int]::TryParse("$(@($kv.Value)[0])", [ref]$n) -and $n -gt $wait) { $wait = $n }
+                        }
+                    }
+                } catch {}
+                if ($wait -le 0) { $wait = [int](2 * [math]::Pow(2, $attempt)) }
+                $wait = [math]::Min($wait, 60)
+                Write-Host "    HTTP $code, retrying in ${wait}s..." -ForegroundColor DarkYellow
+                Start-Sleep -Seconds $wait
+                continue
+            }
+            $content = "$($resp.Content)"
+            if ($content.Length -gt 500) { $content = $content.Substring(0, 500) }
+            throw "HTTP $code from $Method $($next -replace '\?.*$', ''): $content"
+        }
+        $obj = if ($resp.Content) { $resp.Content | ConvertFrom-Json } else { $null }
+        $null = $pages.Add($obj)
+        $next = $null
+        if ($FollowNextLink -and $obj) {
+            $next = Get-FirstNonEmpty $obj.nextLink $(if ($obj.properties) { $obj.properties.nextLink })
+            if ($next -and (Get-Date) -ge $deadline) {
+                $script:lastRestTruncated = $true
+                Write-Host "    Time budget reached; results truncated" -ForegroundColor DarkYellow
+                $next = $null
+            }
+        }
+    }
+    return $pages
+}
 
-function Write-SectionError {
-    param($ErrorRecord, [string]$Context = '')
-    $where = if ($Context) { $Context }
-             elseif ($ErrorRecord.InvocationInfo) { "Line $($ErrorRecord.InvocationInfo.ScriptLineNumber)" }
-             else { 'Unknown' }
-    $msg = if ($ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { "$ErrorRecord" }
-    $null = $sectionErrors.Add([PSCustomObject]@{
-        Subscription = $script:currentSubName
-        Context      = $where
-        Error        = $msg
-    })
+# Azure Resource Graph query over REST (no Az.ResourceGraph dependency), paged with $skipToken
+# and bounded by a time budget. On timeout returns partial rows and marks the dataset Partial.
+function Invoke-ResourceGraphQuery {
+    param([string]$Query, [string[]]$Subscriptions, [string]$Dataset, [int]$TimeoutSeconds = $SectionTimeoutSeconds)
+    $rows = [System.Collections.ArrayList]::new()
+    $subs = @($Subscriptions | Where-Object { $_ })
+    if ($subs.Count -eq 0) { return @() }
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    for ($i = 0; $i -lt $subs.Count; $i += 1000) {
+        $chunk = @($subs[$i..([math]::Min($i + 999, $subs.Count - 1))])
+        $skip = $null
+        do {
+            $remaining = [int]($deadline - (Get-Date)).TotalSeconds
+            if ($remaining -le 0) {
+                Set-NotCollected -Dataset $Dataset -Reason "Resource Graph query exceeded ${TimeoutSeconds}s; results truncated"
+                Write-Host "    Resource Graph time budget reached; partial results" -ForegroundColor DarkYellow
+                return $rows
+            }
+            $opts = @{ '$top' = 1000; resultFormat = 'objectArray' }
+            if ($skip) { $opts['$skipToken'] = $skip }
+            $body = @{ subscriptions = $chunk; query = $Query; options = $opts }
+            $page = @(Invoke-ArmRest -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01' -Method POST -Body $body -TimeoutSeconds $remaining)[0]
+            foreach ($r in @($page.data)) { if ($null -ne $r) { $null = $rows.Add($r) } }
+            $skip = $page.'$skipToken'
+        } while ($skip)
+    }
+    return $rows
+}
+
+# NSG helpers: internet-sourced prefixes and management/data ports that make an open rule CRITICAL
+$internetSources = @('*', 'Internet', '0.0.0.0/0', 'Any', '::/0')
+$criticalPorts   = @(22, 3389, 1433, 3306, 5432, 445)
+function Test-PortSpecCovers {
+    param([string[]]$PortSpecs, [int[]]$Ports)
+    foreach ($spec in @($PortSpecs)) {
+        $s = "$spec".Trim()
+        if (-not $s) { continue }
+        if ($s -eq '*') { return $true }
+        if ($s -match '^(\d+)\s*-\s*(\d+)$') {
+            $lo = [int]$Matches[1]; $hi = [int]$Matches[2]
+            foreach ($p in $Ports) { if ($p -ge $lo -and $p -le $hi) { return $true } }
+        } elseif ($s -match '^\d+$') {
+            if ([int]$s -in $Ports) { return $true }
+        }
+    }
+    return $false
+}
+
+# Az module check: import optional modules up front, record versions, and warn on anything missing
+$requiredModules = @('Az.Accounts','Az.Resources','Az.Compute','Az.Network','Az.Storage','Az.Monitor')
+$optionalModules = @(
+    'Az.Websites','Az.Sql','Az.PostgreSql','Az.MySql','Az.CosmosDB','Az.RedisCache','Az.KeyVault',
+    'Az.Security','Az.PolicyInsights','Az.Advisor','Az.Billing','Az.Reservations','Az.RecoveryServices',
+    'Az.OperationalInsights','Az.Aks','Az.ContainerInstance','Az.ContainerRegistry','Az.ServiceBus',
+    'Az.EventHub','Az.ApiManagement','Az.DataFactory','Az.Automation','Az.ConnectedMachine','Az.Cdn',
+    'Az.PrivateDns','Az.Dns'
+)
+$azModuleVersions = [ordered]@{}
+$missingModules = [System.Collections.ArrayList]::new()
+foreach ($m in ($requiredModules + $optionalModules)) {
+    $avail = Get-Module -ListAvailable -Name $m -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+    if ($avail) {
+        $loaded = Get-Module -Name $m
+        if (-not $loaded -and $m -in @('Az.Reservations','Az.PostgreSql','Az.MySql')) {
+            try { Import-Module $m -ErrorAction Stop -WarningAction SilentlyContinue | Out-Null; $loaded = Get-Module -Name $m } catch {}
+        }
+        $azModuleVersions[$m] = if ($loaded) { "$(@($loaded)[0].Version)" } else { "$($avail.Version)" }
+    } else {
+        $null = $missingModules.Add($m)
+    }
+}
+if ($missingModules.Count -gt 0) {
+    Write-Host "  ! Optional Az modules not installed (related sections fall back to REST or are skipped):" -ForegroundColor DarkYellow
+    Write-Host "    Install-Module $($missingModules -join ',') -Scope CurrentUser -Repository PSGallery -Force" -ForegroundColor DarkYellow
 }
 #endregion
 
@@ -147,8 +412,40 @@ if (-not $ctx) {
     try { Stop-Transcript | Out-Null } catch {}
     return
 }
-Write-Host "  Signed in as: $($ctx.Account.Id)" -ForegroundColor Green
+Write-Host "  Signed in as: $($ctx.Account.Id) ($($ctx.Account.Type))" -ForegroundColor Green
 Write-Host "  Tenant:       $($ctx.Tenant.Id)" -ForegroundColor Green
+
+# Run summary is written at startup (so a crashed run still records StartTime) and rewritten at the end
+function Write-RunSummary {
+    param([switch]$Final)
+    $now = Get-Date
+    $json = [PSCustomObject]@{
+        ScriptVersion    = $ScriptVersion
+        StartTime        = $startTime.ToString('o')
+        EndTime          = if ($Final) { $now.ToString('o') } else { $null }
+        ElapsedMinutes   = [math]::Round(($now - $startTime).TotalMinutes, 1)
+        Completed        = [bool]$Final
+        PowerShell       = "$($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+        AccountType      = "$($ctx.Account.Type)"
+        AccountId        = "$($ctx.Account.Id)"
+        TenantId         = "$($ctx.Tenant.Id)"
+        Environment      = "$($ctx.Environment.Name)"
+        Parameters       = [PSCustomObject]@{
+            DaysBack = $DaysBack; CostMonths = $CostMonths; SkipMetrics = [bool]$SkipMetrics
+            SectionTimeoutSeconds = $SectionTimeoutSeconds; SubscriptionId = $SubscriptionId
+            SubscriptionInclude = $SubscriptionInclude; SubscriptionExclude = $SubscriptionExclude
+        }
+        AzModuleVersions = [PSCustomObject]$azModuleVersions
+        MissingModules   = @($missingModules)
+        Subscriptions    = @($subscriptions | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Id = $_.Id } })
+        TotalErrors      = $sectionErrors.Count
+        NotCollected     = @($script:datasetNotes.Keys | Sort-Object | ForEach-Object { [PSCustomObject]@{ File = $_; Reason = $script:datasetNotes[$_] } })
+        SectionTimings   = @($sectionTimings)
+        SectionErrors    = @($sectionErrors)
+    } | ConvertTo-Json -Depth 6
+    # No BOM: Windows PowerShell's UTF8 encoding adds one, which breaks strict JSON readers
+    [System.IO.File]::WriteAllText((Join-Path $OutputPath 'Assessment-RunSummary.json'), $json, (New-Object System.Text.UTF8Encoding $false))
+}
 
 if ($SubscriptionId) {
     $subscriptions = @(Get-AzSubscription -SubscriptionId $SubscriptionId)
@@ -197,10 +494,22 @@ $subscriptions | ForEach-Object {
     }
 } | Export-Csv "$OutputPath/Subscriptions.csv" -NoTypeInformation -Encoding UTF8
 #endregion
+Write-RunSummary
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLLECTION ARRAYS - Accumulate across all subscriptions
 # ═══════════════════════════════════════════════════════════════════════════════
+$allActualCostByResource = [System.Collections.ArrayList]::new()
+$allActualCostByService  = [System.Collections.ArrayList]::new()
+$allGuestUsers         = [System.Collections.ArrayList]::new()
+$allManagedIdentities  = [System.Collections.ArrayList]::new()
+$allUserAssignedIds    = [System.Collections.ArrayList]::new()
+$allDefenderRecs       = [System.Collections.ArrayList]::new()
+$protectedVmIds        = @{}   # lowercased VM resource ID -> vault name
+$protectedVmNames      = @{}   # lowercased "sub|rg|name" fallback when SourceResourceId is missing
+$backupFailedSubs      = @{}   # subscriptions whose backup items could not be read
+$privateEndpointTargets = @{}  # lowercased target resource ID -> private endpoint count
+$vmSizeCache           = @{}   # "location|size" -> memory GB
 $allResources          = [System.Collections.ArrayList]::new()
 $allVMs                = [System.Collections.ArrayList]::new()
 $allVMMetrics          = [System.Collections.ArrayList]::new()
@@ -305,8 +614,84 @@ foreach ($sub in $subscriptions) {
     #region ── 2. Compute: Virtual Machines ───────────────────────────────────
     Write-Section "2. Compute: Virtual Machines"
     Write-SubSection "VM Inventory & Status"
-    $vms = Get-AzVM -Status -ErrorAction SilentlyContinue
+    $vms = @(Get-AzVM -Status -ErrorAction SilentlyContinue)
+
+    # Model view (LicenseType, SecurityProfile) and disks keyed by ID; the disk list is reused in section 6
+    $vmModels = @{}
+    try { Get-AzVM -ErrorAction Stop | ForEach-Object { if ($_.Id) { $vmModels[$_.Id.ToLower()] = $_ } } }
+    catch { Write-SectionError $_ -Context 'Get-AzVM (model view)' }
+    $subDisks = @(Get-AzDisk -ErrorAction SilentlyContinue)
+    $diskById = @{}
+    foreach ($d in $subDisks) { if ($d.Id) { $diskById[$d.Id.ToLower()] = $d } }
+
+    # Azure Disk Encryption extensions, via Resource Graph (one query per subscription)
+    $adeVmIds = @{}
+    $adeQueryOk = $true
+    if ($vms.Count -gt 0) {
+        try {
+            $adeQuery = "resources | where type =~ 'microsoft.compute/virtualmachines/extensions' | where tostring(properties.publisher) =~ 'Microsoft.Azure.Security' and tostring(properties.type) in~ ('AzureDiskEncryption','AzureDiskEncryptionForLinux') | project id"
+            foreach ($ext in @(Invoke-ResourceGraphQuery -Query $adeQuery -Subscriptions @($sub.Id))) {
+                $adeVmIds[(($ext.id -replace '/extensions/[^/]+$', '').ToLower())] = $true
+            }
+        } catch { $adeQueryOk = $false; Write-SectionError $_ -Context 'ADE extension query (Resource Graph)' }
+    }
+
+    $sseLabel = @{
+        'EncryptionAtRestWithPlatformKey'           = 'SSE-PMK'
+        'EncryptionAtRestWithCustomerKey'           = 'SSE-CMK'
+        'EncryptionAtRestWithPlatformAndCustomerKeys' = 'SSE-DoubleEncryption'
+    }
+
     foreach ($vm in $vms) {
+        $vmKey   = "$($vm.Id)".ToLower()
+        $model   = $vmModels[$vmKey]
+        $secProf = Get-FirstNonEmpty $(if ($model) { $model.SecurityProfile }) $vm.SecurityProfile
+        $licenseType = Get-FirstNonEmpty $(if ($model) { $model.LicenseType }) $vm.LicenseType
+        $encAtHost = if ($secProf -and $null -ne $secProf.EncryptionAtHost) { [bool]$secProf.EncryptionAtHost } else { $false }
+        $secType   = if ($secProf -and $secProf.SecurityType) { "$($secProf.SecurityType)" } else { 'Standard' }
+
+        $osDiskRef = $vm.StorageProfile.OsDisk
+        $osDiskId  = if ($osDiskRef -and $osDiskRef.ManagedDisk) { "$($osDiskRef.ManagedDisk.Id)".ToLower() } else { $null }
+        $osDisk    = if ($osDiskId) { $diskById[$osDiskId] } else { $null }
+        $osEncType = if ($osDisk -and $osDisk.Encryption) { "$($osDisk.Encryption.Type)" } elseif (-not $osDiskId) { 'Unmanaged' } else { $null }
+        $dataEnc = @(foreach ($dd in @($vm.StorageProfile.DataDisks)) {
+            if ($dd -and $dd.ManagedDisk -and $dd.ManagedDisk.Id) {
+                $dobj = $diskById["$($dd.ManagedDisk.Id)".ToLower()]
+                if ($dobj -and $dobj.Encryption) { "$($dobj.Encryption.Type)" } else { 'Unknown' }
+            }
+        })
+
+        $adeSettings = ($osDiskRef -and $osDiskRef.EncryptionSettings -and $osDiskRef.EncryptionSettings.Enabled) -or
+                       ($osDisk -and $osDisk.EncryptionSettingsCollection -and $osDisk.EncryptionSettingsCollection.Enabled)
+        $adeExt = if (-not $adeQueryOk) { 'Unknown' } elseif ($adeVmIds.ContainsKey($vmKey)) { 'Present' } else { 'None' }
+        $diskEncryption = if ($adeSettings -or $adeExt -eq 'Present') { 'ADE' }
+                          elseif ($encAtHost) { 'EncryptionAtHost' }
+                          elseif ($osEncType -and $sseLabel.ContainsKey($osEncType)) { $sseLabel[$osEncType] }
+                          else { 'Unknown' }
+
+        # Deallocated / stopped duration from the Activity Log (90-day retention)
+        $deallocSince = $null; $deallocDays = $null; $deallocOver90 = $null
+        if ($vm.PowerState -in @('VM deallocated', 'VM stopped')) {
+            try {
+                $events = @(Get-AzActivityLog -ResourceId $vm.Id -StartTime (Get-Date).AddDays(-89) -WarningAction SilentlyContinue -ErrorAction Stop)
+                $hits = @($events | Where-Object {
+                    $op = "$(Get-PropValue $_ @('OperationNameValue','OperationName.Value','OperationName'))"
+                    $st = "$(Get-PropValue $_ @('Status.Value','Status'))"
+                    $op -match 'virtualMachines/(deallocate|powerOff)/action|Deallocate Virtual Machine|Power Off Virtual Machine' -and $st -eq 'Succeeded'
+                } | Sort-Object EventTimestamp -Descending)
+                if ($hits.Count -gt 0) {
+                    $ts = [datetime]$hits[0].EventTimestamp
+                    $deallocSince  = $ts.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    $deallocDays   = [int]((Get-Date).ToUniversalTime() - $ts.ToUniversalTime()).TotalDays
+                    $deallocOver90 = $deallocDays -ge 90
+                } else {
+                    # No stop/deallocate in the retained Activity Log: stopped for at least ~89 days
+                    $deallocDays   = '89+'
+                    $deallocOver90 = $true
+                }
+            } catch { Write-SectionError $_ -Context "Activity Log for $($vm.Name)" }
+        }
+
         $null = $allVMs.Add([PSCustomObject]@{
             Subscription   = $subName
             Name           = $vm.Name
@@ -316,34 +701,99 @@ foreach ($sub in $subscriptions) {
             OsType         = $vm.StorageProfile.OsDisk.OsType
             PowerState     = $vm.PowerState
             AvailabilityZone = ($vm.Zones -join ', ')
-            DiskEncryption = if ($vm.StorageProfile.OsDisk.EncryptionSettings -and $vm.StorageProfile.OsDisk.EncryptionSettings.Enabled) { 'Enabled' } else { 'Check ADE' }
+            DiskEncryption = $diskEncryption
+            ResourceId     = $vm.Id
+            LicenseType    = if ($licenseType) { $licenseType } else { 'None' }
+            SecurityType   = $secType
+            EncryptionAtHost = $encAtHost
+            OsDiskEncryptionType = $osEncType
+            DataDiskEncryptionTypes = Join-Values $dataEnc
+            ADEExtension   = $adeExt
+            DeallocatedSinceUtc = $deallocSince
+            DeallocatedDays = $deallocDays
+            DeallocatedOver90Days = $deallocOver90
         })
     }
 
     if (-not $SkipMetrics -and $vms) {
-        Write-SubSection "VM CPU/Memory Metrics (${DaysBack}d)"
+        Write-SubSection "VM CPU/Memory/Disk Metrics (${DaysBack}d)"
         $runningVMs = @($vms | Where-Object { $_.PowerState -eq 'VM running' })
         $vmCount = $runningVMs.Count
         $vmIndex = 0
+        $vmMetricNames = @('Percentage CPU', 'Available Memory Bytes', 'OS Disk IOPS Consumed Percentage', 'Data Disk IOPS Consumed Percentage')
         foreach ($vm in $runningVMs) {
             $vmIndex++
             Write-Host "    [$vmIndex/$vmCount] Collecting metrics for $($vm.Name)..." -ForegroundColor DarkGray -NoNewline
             try {
-                $cpuMetric = Get-MetricSafe -ResourceId $vm.Id -MetricName 'Percentage CPU'
+                $metrics = @(Get-MetricSafe -ResourceId $vm.Id -MetricName $vmMetricNames)
+                if ($metrics.Count -eq 0) { $metrics = @(Get-MetricSafe -ResourceId $vm.Id -MetricName 'Percentage CPU') }
+                $byName = @{}
+                foreach ($m in $metrics) { if ($m -and $m.Name) { $byName["$($m.Name.Value)"] = $m } }
+                $cpuMetric = $byName['Percentage CPU']
                 $avgCpu = if ($cpuMetric) { ($cpuMetric.Data | Measure-Object -Property Average -Average).Average } else { -1 }
                 $maxCpu = if ($cpuMetric) { ($cpuMetric.Data | Measure-Object -Property Average -Maximum).Maximum } else { -1 }
+                if ($null -eq $avgCpu) { $avgCpu = -1 }
+                if ($null -eq $maxCpu) { $maxCpu = -1 }
+
+                # Total memory for the size (cached per location)
+                $vmSize = $vm.HardwareProfile.VmSize
+                $sizeKey = "$($vm.Location)|$vmSize".ToLower()
+                if (-not $vmSizeCache.ContainsKey($sizeKey)) {
+                    try {
+                        foreach ($sz in @(Get-AzVMSize -Location $vm.Location -ErrorAction Stop)) {
+                            $vmSizeCache["$($vm.Location)|$($sz.Name)".ToLower()] = [math]::Round($sz.MemoryInMB / 1024, 2)
+                        }
+                    } catch {}
+                    if (-not $vmSizeCache.ContainsKey($sizeKey)) { $vmSizeCache[$sizeKey] = $null }
+                }
+                $memGB = $vmSizeCache[$sizeKey]
+
+                $avgAvailGB = $null; $minAvailGB = $null; $avgMemPct = $null; $peakMemPct = $null
+                $memMetric = $byName['Available Memory Bytes']
+                if ($memMetric) {
+                    $vals = @($memMetric.Data | Where-Object { $null -ne $_.Average } | ForEach-Object { $_.Average })
+                    if ($vals.Count -gt 0) {
+                        $avgAvailGB = [math]::Round((($vals | Measure-Object -Average).Average) / 1GB, 2)
+                        $minAvailGB = [math]::Round((($vals | Measure-Object -Minimum).Minimum) / 1GB, 2)
+                        if ($memGB) {
+                            $avgMemPct  = [math]::Round(100 * (1 - ($avgAvailGB / $memGB)), 1)
+                            $peakMemPct = [math]::Round(100 * (1 - ($minAvailGB / $memGB)), 1)
+                        }
+                    }
+                }
+                $diskStat = {
+                    param($m)
+                    if (-not $m) { return @($null, $null) }
+                    $v = @($m.Data | Where-Object { $null -ne $_.Average } | ForEach-Object { $_.Average })
+                    if ($v.Count -eq 0) { return @($null, $null) }
+                    return @([math]::Round((($v | Measure-Object -Average).Average), 1), [math]::Round((($v | Measure-Object -Maximum).Maximum), 1))
+                }
+                $osIops   = & $diskStat $byName['OS Disk IOPS Consumed Percentage']
+                $dataIops = & $diskStat $byName['Data Disk IOPS Consumed Percentage']
+
                 $null = $allVMMetrics.Add([PSCustomObject]@{
                     Subscription = $subName
                     VM           = $vm.Name
-                    VMSize       = $vm.HardwareProfile.VmSize
+                    VMSize       = $vmSize
                     AvgCPU       = [math]::Round($avgCpu, 1)
                     PeakCPU      = [math]::Round($maxCpu, 1)
                     Recommendation = if ($avgCpu -lt 5) { 'Candidate for DEALLOCATION' }
                                      elseif ($avgCpu -lt 15) { 'Candidate for DOWNSIZE' }
                                      else { 'OK' }
+                    ResourceGroup = $vm.ResourceGroupName
+                    ResourceId   = $vm.Id
+                    MemoryGB     = $memGB
+                    AvgAvailableMemoryGB = $avgAvailGB
+                    MinAvailableMemoryGB = $minAvailGB
+                    AvgMemoryUsedPct  = $avgMemPct
+                    PeakMemoryUsedPct = $peakMemPct
+                    AvgOsDiskIopsPct  = $osIops[0]
+                    PeakOsDiskIopsPct = $osIops[1]
+                    AvgDataDiskIopsPct  = $dataIops[0]
+                    PeakDataDiskIopsPct = $dataIops[1]
                 })
                 Write-Host " done" -ForegroundColor DarkGray
-            } catch { Write-Host " failed" -ForegroundColor DarkYellow }
+            } catch { Write-Host " failed" -ForegroundColor DarkYellow; Write-SectionError $_ -Context "Metrics for $($vm.Name)" }
         }
     }
 
@@ -386,25 +836,36 @@ foreach ($sub in $subscriptions) {
     }
 
     Write-SubSection "Web Apps"
-    Get-AzWebApp -ErrorAction SilentlyContinue | ForEach-Object {
-        $null = $allWebApps.Add([PSCustomObject]@{
-            Subscription   = $subName
-            Name           = $_.Name
-            ResourceGroup  = $_.ResourceGroup
-            Plan           = if ($_.AppServicePlanId) { $_.AppServicePlanId.Split('/')[-1] } else { $null }
-            State          = $_.State
-            HttpsOnly      = $_.HttpsOnly
-            MinTlsVersion  = if ($_.SiteConfig) { $_.SiteConfig.MinTlsVersion } else { $null }
-            AlwaysOn       = if ($_.SiteConfig) { $_.SiteConfig.AlwaysOn } else { $null }
-            Runtime        = ($_.SiteConfig.LinuxFxVersion + $_.SiteConfig.WindowsFxVersion)
-        })
-    }
+    try {
+        foreach ($site in @(Get-AzWebApp -ErrorAction Stop)) {
+            # The list call omits SiteConfig; fetch each app for MinTlsVersion/AlwaysOn/runtime
+            $app = $null
+            try { $app = Get-AzWebApp -ResourceGroupName $site.ResourceGroup -Name $site.Name -ErrorAction Stop } catch {}
+            if (-not $app) { $app = $site }
+            $cfg = $app.SiteConfig
+            $null = $allWebApps.Add([PSCustomObject]@{
+                Subscription   = $subName
+                Name           = $app.Name
+                ResourceGroup  = $app.ResourceGroup
+                Plan           = Get-LastSegment (Get-FirstNonEmpty $app.ServerFarmId $site.ServerFarmId $app.AppServicePlanId)
+                State          = $app.State
+                HttpsOnly      = $app.HttpsOnly
+                MinTlsVersion  = if ($cfg) { $cfg.MinTlsVersion } else { $null }
+                AlwaysOn       = if ($cfg) { $cfg.AlwaysOn } else { $null }
+                Runtime        = if ($cfg) { "$($cfg.LinuxFxVersion)$($cfg.WindowsFxVersion)" } else { $null }
+                Kind           = $app.Kind
+                ResourceId     = $app.Id
+                FtpsState      = if ($cfg) { $cfg.FtpsState } else { $null }
+                PublicNetworkAccess = Get-PropValue $app @('PublicNetworkAccess')
+            })
+        }
+    } catch { Write-SectionError $_ -Context 'Get-AzWebApp' -Dataset '03_WebApps.csv' }
     #endregion
 
     #region ── 4. Azure Functions ──────────────────────────────────────────────
     Write-Section "4. Azure Functions"
     try {
-        Get-AzResource -ResourceType 'Microsoft.Web/sites' -ErrorAction SilentlyContinue |
+        Get-AzResource -ResourceType 'Microsoft.Web/sites' -ErrorAction Stop |
             Where-Object { $_.Kind -match 'functionapp' } | ForEach-Object {
                 $fa = Get-AzWebApp -ResourceGroupName $_.ResourceGroupName -Name $_.Name -ErrorAction SilentlyContinue
                 if ($fa) {
@@ -413,66 +874,77 @@ foreach ($sub in $subscriptions) {
                         Name          = $fa.Name
                         ResourceGroup = $fa.ResourceGroup
                         State         = $fa.State
-                        Runtime       = ($fa.SiteConfig.LinuxFxVersion + $fa.SiteConfig.WindowsFxVersion)
+                        Runtime       = if ($fa.SiteConfig) { "$($fa.SiteConfig.LinuxFxVersion)$($fa.SiteConfig.WindowsFxVersion)" } else { $null }
                         HttpsOnly     = $fa.HttpsOnly
-                        Plan          = if ($fa.AppServicePlanId) { $fa.AppServicePlanId.Split('/')[-1] } else { $null }
+                        Plan          = Get-LastSegment (Get-FirstNonEmpty $fa.ServerFarmId $fa.AppServicePlanId)
                         Kind          = $_.Kind
+                        MinTlsVersion = if ($fa.SiteConfig) { $fa.SiteConfig.MinTlsVersion } else { $null }
+                        ResourceId    = $fa.Id
                     })
                 }
             }
-    } catch { Write-SectionError $_ }
+    } catch { Write-SectionError $_ -Dataset '04_Functions.csv' }
     #endregion
 
     #region ── 5. Logic Apps ──────────────────────────────────────────────────
     Write-Section "5. Logic Apps"
     try {
-        Get-AzResource -ResourceType 'Microsoft.Logic/workflows' -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-AzResource -ResourceType 'Microsoft.Logic/workflows' -ExpandProperties -ErrorAction Stop | ForEach-Object {
             $null = $allLogicApps.Add([PSCustomObject]@{
                 Subscription  = $subName
                 Name          = $_.Name
                 ResourceGroup = $_.ResourceGroupName
                 Location      = $_.Location
-                State         = $_.Properties.state
+                State         = Get-PropValue $_ @('Properties.state', 'Properties.State')
+                ResourceId    = $_.ResourceId
             })
         }
-    } catch { Write-SectionError $_ }
+    } catch { Write-SectionError $_ -Dataset '05_LogicApps.csv' }
     #endregion
 
     #region ── 6. Storage ─────────────────────────────────────────────────────
     Write-Section "6. Storage Assessment"
     Write-SubSection "Managed Disks"
-    Get-AzDisk -ErrorAction SilentlyContinue | ForEach-Object {
+    foreach ($disk in $subDisks) {
         $null = $allDisks.Add([PSCustomObject]@{
             Subscription  = $subName
-            Name          = $_.Name
-            ResourceGroup = $_.ResourceGroupName
-            AttachedTo    = if ($_.ManagedBy) { $_.ManagedBy.Split('/')[-1] } else { 'UNATTACHED' }
-            DiskSizeGB    = $_.DiskSizeGB
-            SKU           = if ($_.Sku) { $_.Sku.Name } else { $null }
-            IOPS          = $_.DiskIOPSReadWrite
-            ThroughputMBps = $_.DiskMBpsReadWrite
-            Encryption    = if ($_.EncryptionSettingsCollection) { $_.EncryptionSettingsCollection.Enabled } else { $null }
-            Location      = $_.Location
-            CreatedDate   = $_.TimeCreated
+            Name          = $disk.Name
+            ResourceGroup = $disk.ResourceGroupName
+            AttachedTo    = if ($disk.ManagedBy) { Get-LastSegment $disk.ManagedBy } else { 'UNATTACHED' }
+            DiskSizeGB    = $disk.DiskSizeGB
+            SKU           = if ($disk.Sku) { $disk.Sku.Name } else { $null }
+            IOPS          = $disk.DiskIOPSReadWrite
+            ThroughputMBps = $disk.DiskMBpsReadWrite
+            Encryption    = if ($disk.EncryptionSettingsCollection) { $disk.EncryptionSettingsCollection.Enabled } else { $null }
+            Location      = $disk.Location
+            CreatedDate   = $disk.TimeCreated
+            EncryptionType = if ($disk.Encryption) { $disk.Encryption.Type } else { $null }
+            DiskState     = $disk.DiskState
+            ResourceId    = $disk.Id
         })
     }
 
     Write-SubSection "Snapshots"
     Get-AzSnapshot -ErrorAction SilentlyContinue | ForEach-Object {
+        $created = $_.TimeCreated
+        $age = if ($created) { ((Get-Date) - $created).Days } else { $null }
         $null = $allSnapshots.Add([PSCustomObject]@{
             Subscription  = $subName
             Name          = $_.Name
             ResourceGroup = $_.ResourceGroupName
             DiskSizeGB    = $_.DiskSizeGB
-            AgeDays       = ((Get-Date) - $_.TimeCreated).Days
-            CreatedDate   = $_.TimeCreated.ToString('yyyy-MM-dd')
-            Recommendation = if (((Get-Date) - $_.TimeCreated).Days -gt 90) { 'REVIEW - Over 90 days old' } else { 'OK' }
+            AgeDays       = $age
+            CreatedDate   = if ($created) { $created.ToString('yyyy-MM-dd') } else { $null }
+            Recommendation = if ($null -ne $age -and $age -gt 90) { 'REVIEW - Over 90 days old' } else { 'OK' }
         })
     }
 
     Write-SubSection "Storage Accounts"
-    $storAccts = Get-AzStorageAccount -ErrorAction SilentlyContinue
+    $storAccts = @(Get-AzStorageAccount -ErrorAction SilentlyContinue)
+    $shareDeadline = (Get-Date).AddSeconds($SectionTimeoutSeconds)
+    $shareTimedOut = $false
     foreach ($sa in $storAccts) {
+        $acl = $sa.NetworkRuleSet
         $null = $allStorageAccounts.Add([PSCustomObject]@{
             Subscription   = $subName
             Name           = $sa.StorageAccountName
@@ -484,21 +956,37 @@ foreach ($sub in $subscriptions) {
             MinTLS         = $sa.MinimumTlsVersion
             PublicAccess    = $sa.AllowBlobPublicAccess
             Location       = $sa.PrimaryLocation
+            ResourceId     = $sa.Id
+            PublicNetworkAccess = Get-FirstNonEmpty $sa.PublicNetworkAccess 'Enabled'
+            NetworkDefaultAction = if ($acl) { "$($acl.DefaultAction)" } else { 'Allow' }
+            IpRuleCount    = if ($acl) { @($acl.IpRules | Where-Object { $_ }).Count } else { 0 }
+            VNetRuleCount  = if ($acl) { @($acl.VirtualNetworkRules | Where-Object { $_ }).Count } else { 0 }
+            AllowSharedKeyAccess = if ($null -eq $sa.AllowSharedKeyAccess) { $true } else { $sa.AllowSharedKeyAccess }
+            PrivateEndpointCount = $null
         })
 
-        # File Shares
+        # File shares via the control plane (no data-plane keys, no hangs on firewalled accounts)
+        if ($sa.Kind -in @('BlobStorage', 'BlockBlobStorage')) { continue }
+        if ($shareTimedOut) { continue }
+        if ((Get-Date) -gt $shareDeadline) {
+            $shareTimedOut = $true
+            Set-NotCollected -Dataset '06_FileShares.csv' -Reason "[$subName] file share enumeration exceeded ${SectionTimeoutSeconds}s; remaining accounts skipped"
+            Write-Host "    File share time budget reached; skipping remaining accounts" -ForegroundColor DarkYellow
+            continue
+        }
         try {
-            $saContext = $sa.Context
-            Get-AzStorageShare -Context $saContext -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-AzRmStorageShare -ResourceGroupName $sa.ResourceGroupName -StorageAccountName $sa.StorageAccountName -ErrorAction Stop | ForEach-Object {
                 $null = $allFileShares.Add([PSCustomObject]@{
                     Subscription   = $subName
                     StorageAccount = $sa.StorageAccountName
                     ShareName      = $_.Name
-                    QuotaGB        = $_.ShareProperties.QuotaInGB
-                    AccessTier     = $_.ShareProperties.AccessTier
+                    QuotaGB        = $_.QuotaGiB
+                    AccessTier     = $_.AccessTier
+                    ResourceGroup  = $sa.ResourceGroupName
+                    EnabledProtocols = $_.EnabledProtocols
                 })
             }
-        } catch { Write-SectionError $_ }
+        } catch { Write-SectionError $_ -Context "File shares: $($sa.StorageAccountName)" -Dataset '06_FileShares.csv' }
     }
     #endregion
 
@@ -507,25 +995,25 @@ foreach ($sub in $subscriptions) {
     Write-SubSection "Virtual Networks & Subnets"
     Get-AzVirtualNetwork -ErrorAction SilentlyContinue | ForEach-Object {
         $vnet = $_
-        $vnet.Subnets | ForEach-Object {
+        @($vnet.Subnets) | Where-Object { $_ } | ForEach-Object {
             $null = $allVNets.Add([PSCustomObject]@{
                 Subscription = $subName
                 VNet         = $vnet.Name
                 AddressSpace = ($vnet.AddressSpace.AddressPrefixes -join ', ')
                 Subnet       = $_.Name
                 SubnetPrefix = ($_.AddressPrefix -join ', ')
-                NSG          = if ($_.NetworkSecurityGroup) { $_.NetworkSecurityGroup.Id.Split('/')[-1] } else { 'NONE' }
-                RouteTable   = if ($_.RouteTable) { $_.RouteTable.Id.Split('/')[-1] } else { 'NONE' }
+                NSG          = if ($_.NetworkSecurityGroup) { Get-LastSegment $_.NetworkSecurityGroup.Id } else { 'NONE' }
+                RouteTable   = if ($_.RouteTable) { Get-LastSegment $_.RouteTable.Id } else { 'NONE' }
             })
         }
 
         # VNet Peerings
-        $_.VirtualNetworkPeerings | ForEach-Object {
+        @($vnet.VirtualNetworkPeerings) | Where-Object { $_ } | ForEach-Object {
             $null = $allPeerings.Add([PSCustomObject]@{
                 Subscription       = $subName
                 VNet               = $vnet.Name
                 PeeringName        = $_.Name
-                RemoteVNet         = if ($_.RemoteVirtualNetwork -and $_.RemoteVirtualNetwork.Id) { $_.RemoteVirtualNetwork.Id.Split('/')[-1] } else { $null }
+                RemoteVNet         = if ($_.RemoteVirtualNetwork) { Get-LastSegment $_.RemoteVirtualNetwork.Id } else { $null }
                 State              = $_.PeeringState
                 AllowForwarded     = $_.AllowForwardedTraffic
                 AllowGatewayTransit = $_.AllowGatewayTransit
@@ -535,40 +1023,61 @@ foreach ($sub in $subscriptions) {
     }
 
     Write-SubSection "Orphaned Public IPs"
-    Get-AzPublicIpAddress -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($null -eq $_.IpConfiguration) {
-            $null = $allPublicIPs.Add([PSCustomObject]@{
-                Subscription  = $subName
-                Name          = $_.Name
-                ResourceGroup = $_.ResourceGroupName
-                IpAddress     = $_.IpAddress
-                SKU           = if ($_.Sku) { $_.Sku.Name } else { $null }
-                Allocation    = $_.PublicIpAllocationMethod
-            })
+    # IPs referenced by a NAT gateway are in use even though IpConfiguration is empty
+    $natIpIds = @{}
+    $subNatGateways = @()
+    try {
+        $subNatGateways = @(Get-AzNatGateway -ErrorAction Stop)
+        foreach ($ng in $subNatGateways) {
+            foreach ($pip in @($ng.PublicIpAddresses)) { if ($pip -and $pip.Id) { $natIpIds[$pip.Id.ToLower()] = $ng.Name } }
         }
-    }
+    } catch { Write-SectionError $_ -Context 'Get-AzNatGateway (public IP attachment)' }
+    try {
+        Get-AzPublicIpAddress -ErrorAction Stop | ForEach-Object {
+            $attached = ($null -ne $_.IpConfiguration) -or ($null -ne $_.NatGateway) -or ($_.Id -and $natIpIds.ContainsKey($_.Id.ToLower()))
+            if (-not $attached) {
+                $null = $allPublicIPs.Add([PSCustomObject]@{
+                    Subscription  = $subName
+                    Name          = $_.Name
+                    ResourceGroup = $_.ResourceGroupName
+                    IpAddress     = $_.IpAddress
+                    SKU           = if ($_.Sku) { $_.Sku.Name } else { $null }
+                    Allocation    = $_.PublicIpAllocationMethod
+                    ResourceId    = $_.Id
+                    Location      = $_.Location
+                })
+            }
+        }
+    } catch { Write-SectionError $_ -Dataset '07_OrphanedPublicIPs.csv' }
 
     Write-SubSection "NSG Rule Audit"
-    Get-AzNetworkSecurityGroup -ErrorAction SilentlyContinue | ForEach-Object {
-        $nsg = $_
-        $_.SecurityRules | Where-Object {
-            $_.Access -eq 'Allow' -and
-            ($_.SourceAddressPrefix -eq '*' -or $_.SourceAddressPrefix -eq 'Internet') -and
-            $_.Direction -eq 'Inbound'
-        } | ForEach-Object {
-            $severity = 'Medium'
-            if ($_.DestinationPortRange -in @('22','3389','1433','3306','5432','445','*')) { $severity = 'CRITICAL' }
-            $null = $allNSGRules.Add([PSCustomObject]@{
-                Subscription  = $subName
-                NSG           = $nsg.Name
-                Rule          = $_.Name
-                Priority      = $_.Priority
-                DestPort      = $_.DestinationPortRange
-                Source         = $_.SourceAddressPrefix
-                Severity      = $severity
-            })
+    try {
+        Get-AzNetworkSecurityGroup -ErrorAction Stop | ForEach-Object {
+            $nsg = $_
+            foreach ($rule in @($nsg.SecurityRules)) {
+                if (-not $rule -or $rule.Access -ne 'Allow' -or $rule.Direction -ne 'Inbound') { continue }
+                # SourceAddressPrefix / DestinationPortRange are List[string]; merge with the plural forms
+                $sources = @(Join-Values @($rule.SourceAddressPrefix, $rule.SourceAddressPrefixes) -Separator "`n" | ForEach-Object { $_ -split "`n" } | Where-Object { $_ })
+                $ports   = @(Join-Values @($rule.DestinationPortRange, $rule.DestinationPortRanges) -Separator "`n" | ForEach-Object { $_ -split "`n" } | Where-Object { $_ })
+                $fromInternet = @($sources | Where-Object { $_ -in $internetSources }).Count -gt 0
+                if (-not $fromInternet) { continue }
+                $severity = 'Medium'
+                if (Test-PortSpecCovers -PortSpecs $ports -Ports $criticalPorts) { $severity = 'CRITICAL' }
+                $null = $allNSGRules.Add([PSCustomObject]@{
+                    Subscription  = $subName
+                    NSG           = $nsg.Name
+                    Rule          = $rule.Name
+                    Priority      = $rule.Priority
+                    DestPort      = ($ports -join ',')
+                    Source        = ($sources -join ',')
+                    Severity      = $severity
+                    ResourceGroup = $nsg.ResourceGroupName
+                    Protocol      = $rule.Protocol
+                    DestinationAddress = Join-Values @($rule.DestinationAddressPrefix, $rule.DestinationAddressPrefixes)
+                })
+            }
         }
-    }
+    } catch { Write-SectionError $_ -Dataset '07_OpenNSGRules.csv' }
 
     Write-SubSection "Load Balancers"
     Get-AzLoadBalancer -ErrorAction SilentlyContinue | ForEach-Object {
@@ -646,7 +1155,7 @@ foreach ($sub in $subscriptions) {
 
     Write-SubSection "NAT Gateways"
     try {
-        Get-AzNatGateway -ErrorAction SilentlyContinue | ForEach-Object {
+        $subNatGateways | ForEach-Object {
             $null = $allNATGateways.Add([PSCustomObject]@{
                 Subscription        = $subName
                 Name                = $_.Name
@@ -688,15 +1197,26 @@ foreach ($sub in $subscriptions) {
     }
 
     Write-SubSection "Private Endpoints & DNS"
-    Get-AzPrivateEndpoint -ErrorAction SilentlyContinue | ForEach-Object {
-        $null = $allPrivateEndpoints.Add([PSCustomObject]@{
-            Subscription      = $subName
-            Name              = $_.Name
-            ResourceGroup     = $_.ResourceGroupName
-            Subnet            = if ($_.Subnet -and $_.Subnet.Id) { $_.Subnet.Id.Split('/')[-1] } else { $null }
-            PrivateLinkService = ($_.PrivateLinkServiceConnections.Name -join ', ')
-        })
-    }
+    try {
+        Get-AzPrivateEndpoint -ErrorAction Stop | ForEach-Object {
+            $conns = @(@($_.PrivateLinkServiceConnections) + @($_.ManualPrivateLinkServiceConnections) | Where-Object { $_ })
+            $targets = @($conns | ForEach-Object { $_.PrivateLinkServiceId } | Where-Object { $_ })
+            foreach ($t in ($targets | Select-Object -Unique)) {
+                $k = "$t".ToLower()
+                $privateEndpointTargets[$k] = 1 + [int]$privateEndpointTargets[$k]
+            }
+            $null = $allPrivateEndpoints.Add([PSCustomObject]@{
+                Subscription      = $subName
+                Name              = $_.Name
+                ResourceGroup     = $_.ResourceGroupName
+                Subnet            = if ($_.Subnet) { Get-LastSegment $_.Subnet.Id } else { $null }
+                PrivateLinkService = ($conns.Name -join ', ')
+                TargetResourceId  = Join-Values $targets
+                GroupIds          = Join-Values @($conns | ForEach-Object { $_.GroupIds })
+                ConnectionState   = Join-Values @($conns | ForEach-Object { if ($_.PrivateLinkServiceConnectionState) { $_.PrivateLinkServiceConnectionState.Status } })
+            })
+        }
+    } catch { Write-SectionError $_ -Dataset '07_PrivateEndpoints.csv' }
     Get-AzPrivateDnsZone -ErrorAction SilentlyContinue | ForEach-Object {
         $null = $allPrivateDNS.Add([PSCustomObject]@{
             Subscription  = $subName
@@ -751,30 +1271,86 @@ foreach ($sub in $subscriptions) {
     #region ── 8. Database Services ───────────────────────────────────────────
     Write-Section "8. Database Services"
     Write-SubSection "Azure SQL"
-    Get-AzSqlServer -ErrorAction SilentlyContinue | ForEach-Object {
-        $server = $_
-        $null = $allSQLServers.Add([PSCustomObject]@{
-            Subscription  = $subName
-            ServerName    = $_.ServerName
-            ResourceGroup = $_.ResourceGroupName
-            Location      = $_.Location
-            AdminLogin    = $_.SqlAdministratorLogin
-            Version       = $_.ServerVersion
-        })
-        Get-AzSqlDatabase -ServerName $_.ServerName -ResourceGroupName $_.ResourceGroupName -ErrorAction SilentlyContinue |
-            Where-Object { $_.DatabaseName -ne 'master' } | ForEach-Object {
-                $null = $allSQLDatabases.Add([PSCustomObject]@{
-                    Subscription     = $subName
-                    Server           = $server.ServerName
-                    Database         = $_.DatabaseName
-                    Edition          = $_.Edition
-                    ServiceObjective = $_.CurrentServiceObjectiveName
-                    MaxSizeGB        = [math]::Round($_.MaxSizeBytes / 1GB, 2)
-                    Status           = $_.Status
-                    ZoneRedundant    = $_.ZoneRedundant
-                })
-            }
-    }
+    try {
+        Get-AzSqlServer -ErrorAction Stop | ForEach-Object {
+            $server = $_
+            $srvRg = $server.ResourceGroupName; $srvName = $server.ServerName
+
+            $entraOnly = $null; $entraAdmin = $null
+            try { $entraOnly = (Get-AzSqlServerActiveDirectoryOnlyAuthentication -ServerName $srvName -ResourceGroupName $srvRg -ErrorAction Stop).AzureADOnlyAuthentication }
+            catch { Write-SectionError $_ -Context "SQL Entra-only auth: $srvName" }
+            try { $entraAdmin = (Get-AzSqlServerActiveDirectoryAdministrator -ServerName $srvName -ResourceGroupName $srvRg -ErrorAction Stop).DisplayName }
+            catch {}
+
+            $auditEnabled = $null; $auditDest = $null
+            try {
+                $audit = Get-AzSqlServerAudit -ServerName $srvName -ResourceGroupName $srvRg -ErrorAction Stop
+                $dests = @()
+                if ("$($audit.BlobStorageTargetState)" -eq 'Enabled') { $dests += 'Storage' }
+                if ("$($audit.LogAnalyticsTargetState)" -eq 'Enabled') { $dests += 'LogAnalytics' }
+                if ("$($audit.EventHubTargetState)" -eq 'Enabled')     { $dests += 'EventHub' }
+                $auditEnabled = $dests.Count -gt 0
+                $auditDest = $dests -join ','
+            } catch { Write-SectionError $_ -Context "SQL auditing: $srvName" }
+
+            $fwRules = @()
+            $allowAzure = $null; $openToInternet = $null
+            try {
+                $fwRules = @(Get-AzSqlServerFirewallRule -ServerName $srvName -ResourceGroupName $srvRg -ErrorAction Stop)
+                $allowAzure = @($fwRules | Where-Object { $_.StartIpAddress -eq '0.0.0.0' -and $_.EndIpAddress -eq '0.0.0.0' }).Count -gt 0
+                # A rule spanning a /8 or more is treated as open to the internet
+                $openToInternet = @($fwRules | Where-Object {
+                    $s = $null; $e = $null
+                    if ([System.Net.IPAddress]::TryParse("$($_.StartIpAddress)", [ref]$s) -and [System.Net.IPAddress]::TryParse("$($_.EndIpAddress)", [ref]$e)) {
+                        $sb = $s.GetAddressBytes(); $eb = $e.GetAddressBytes()
+                        $sv = [uint64]$sb[0] * 16777216 + [uint64]$sb[1] * 65536 + [uint64]$sb[2] * 256 + [uint64]$sb[3]
+                        $ev = [uint64]$eb[0] * 16777216 + [uint64]$eb[1] * 65536 + [uint64]$eb[2] * 256 + [uint64]$eb[3]
+                        ($ev - $sv) -ge 16777215 -and $ev -ge $sv
+                    } else { $false }
+                }).Count -gt 0
+            } catch { Write-SectionError $_ -Context "SQL firewall: $srvName" }
+
+            $null = $allSQLServers.Add([PSCustomObject]@{
+                Subscription  = $subName
+                ServerName    = $srvName
+                ResourceGroup = $srvRg
+                Location      = $server.Location
+                AdminLogin    = $server.SqlAdministratorLogin
+                Version       = $server.ServerVersion
+                ResourceId    = $server.ResourceId
+                PublicNetworkAccess = Get-FirstNonEmpty $server.PublicNetworkAccess 'Enabled'
+                MinimalTlsVersion = $server.MinimalTlsVersion
+                EntraOnlyAuth = $entraOnly
+                EntraAdmin    = $entraAdmin
+                AuditingEnabled = $auditEnabled
+                AuditDestinations = $auditDest
+                AllowAzureServices = $allowAzure
+                OpenToInternet = $openToInternet
+                FirewallRuleCount = $fwRules.Count
+                PrivateEndpointCount = $null
+            })
+            Get-AzSqlDatabase -ServerName $srvName -ResourceGroupName $srvRg -ErrorAction SilentlyContinue |
+                Where-Object { $_.DatabaseName -ne 'master' } | ForEach-Object {
+                    $tde = $null
+                    try { $tde = "$((Get-AzSqlDatabaseTransparentDataEncryption -ServerName $srvName -ResourceGroupName $srvRg -DatabaseName $_.DatabaseName -ErrorAction Stop).State)" }
+                    catch {}
+                    $null = $allSQLDatabases.Add([PSCustomObject]@{
+                        Subscription     = $subName
+                        Server           = $srvName
+                        Database         = $_.DatabaseName
+                        Edition          = $_.Edition
+                        ServiceObjective = $_.CurrentServiceObjectiveName
+                        MaxSizeGB        = if ($_.MaxSizeBytes) { [math]::Round($_.MaxSizeBytes / 1GB, 2) } else { $null }
+                        Status           = $_.Status
+                        ZoneRedundant    = $_.ZoneRedundant
+                        ResourceGroup    = $srvRg
+                        TDE              = $tde
+                        ElasticPool      = $_.ElasticPoolName
+                        ResourceId       = $_.ResourceId
+                    })
+                }
+        }
+    } catch { Write-SectionError $_ -Dataset '08_SQLServers.csv' }
 
     Write-SubSection "SQL Managed Instances"
     try {
@@ -808,43 +1384,38 @@ foreach ($sub in $subscriptions) {
         }
     }
 
-    Write-SubSection "MySQL Flexible Servers"
-    try {
-        Get-AzResource -ResourceType 'Microsoft.DBforMySQL/flexibleServers' -ErrorAction SilentlyContinue | ForEach-Object {
-            $srv = Get-AzMySqlFlexibleServer -ResourceGroupName $_.ResourceGroupName -Name $_.Name -ErrorAction SilentlyContinue
-            if ($srv) {
-                $null = $allMySQL.Add([PSCustomObject]@{
+    # MySQL / PostgreSQL flexible servers: use the Az.MySql / Az.PostgreSql cmdlets when installed,
+    # filling any gaps from the ARM resource so the section still works without the modules
+    foreach ($flex in @(
+        @{ Label = 'MySQL';      Type = 'Microsoft.DBforMySQL/flexibleServers';      Cmd = 'Get-AzMySqlFlexibleServer';      List = $allMySQL;      File = '08_MySQL.csv' },
+        @{ Label = 'PostgreSQL'; Type = 'Microsoft.DBforPostgreSQL/flexibleServers'; Cmd = 'Get-AzPostgreSqlFlexibleServer'; List = $allPostgreSQL; File = '08_PostgreSQL.csv' }
+    )) {
+        Write-SubSection "$($flex.Label) Flexible Servers"
+        $useCmd = Test-CommandAvailable $flex.Cmd
+        try {
+            Get-AzResource -ResourceType $flex.Type -ExpandProperties -ErrorAction Stop | ForEach-Object {
+                $res = $_
+                $srv = $null
+                if ($useCmd) { try { $srv = & $flex.Cmd -ResourceGroupName $res.ResourceGroupName -Name $res.Name -ErrorAction Stop } catch {} }
+                $null = $flex.List.Add([PSCustomObject]@{
                     Subscription  = $subName
-                    Name          = $srv.Name
-                    ResourceGroup = $srv.ResourceGroupName
-                    SKU           = $srv.SkuName
-                    Tier          = $srv.SkuTier
-                    StorageGB     = $srv.StorageSizeGb
-                    Version       = $srv.Version
-                    State         = $srv.State
+                    Name          = $res.Name
+                    ResourceGroup = $res.ResourceGroupName
+                    SKU           = Get-FirstNonEmpty (Get-PropValue $srv @('SkuName')) (Get-PropValue $res @('Sku.Name'))
+                    Tier          = Get-FirstNonEmpty (Get-PropValue $srv @('SkuTier')) (Get-PropValue $res @('Sku.Tier'))
+                    StorageGB     = Get-FirstNonEmpty (Get-PropValue $srv @('StorageSizeGb','StorageSizeGB')) (Get-PropValue $res @('Properties.storage.storageSizeGB'))
+                    Version       = Get-FirstNonEmpty (Get-PropValue $srv @('Version')) (Get-PropValue $res @('Properties.version'))
+                    State         = Get-FirstNonEmpty (Get-PropValue $srv @('State')) (Get-PropValue $res @('Properties.state'))
+                    Location      = $res.Location
+                    PublicNetworkAccess = Get-PropValue $res @('Properties.network.publicNetworkAccess')
+                    HighAvailability = Get-PropValue $res @('Properties.highAvailability.mode')
+                    BackupRetentionDays = Get-PropValue $res @('Properties.backup.backupRetentionDays')
+                    GeoRedundantBackup = Get-PropValue $res @('Properties.backup.geoRedundantBackup')
+                    ResourceId    = $res.ResourceId
                 })
             }
-        }
-    } catch { Write-SectionError $_ }
-
-    Write-SubSection "PostgreSQL Flexible Servers"
-    try {
-        Get-AzResource -ResourceType 'Microsoft.DBforPostgreSQL/flexibleServers' -ErrorAction SilentlyContinue | ForEach-Object {
-            $srv = Get-AzPostgreSqlFlexibleServer -ResourceGroupName $_.ResourceGroupName -Name $_.Name -ErrorAction SilentlyContinue
-            if ($srv) {
-                $null = $allPostgreSQL.Add([PSCustomObject]@{
-                    Subscription  = $subName
-                    Name          = $srv.Name
-                    ResourceGroup = $srv.ResourceGroupName
-                    SKU           = $srv.SkuName
-                    Tier          = $srv.SkuTier
-                    StorageGB     = $srv.StorageSizeGb
-                    Version       = $srv.Version
-                    State         = $srv.State
-                })
-            }
-        }
-    } catch { Write-SectionError $_ }
+        } catch { Write-SectionError $_ -Dataset $flex.File }
+    }
 
     Write-SubSection "Redis Cache"
     try {
@@ -1004,18 +1575,38 @@ foreach ($sub in $subscriptions) {
 
     #region ── 12. Identity & RBAC ────────────────────────────────────────────
     Write-Section "12. Identity & RBAC"
-    Write-SubSection "Role Assignments"
-    Get-AzRoleAssignment -ErrorAction SilentlyContinue | ForEach-Object {
-        $null = $allRBAC.Add([PSCustomObject]@{
-            Subscription       = $subName
-            DisplayName        = $_.DisplayName
-            SignInName         = $_.SignInName
-            RoleDefinitionName = $_.RoleDefinitionName
-            Scope              = $_.Scope
-            ObjectType         = $_.ObjectType
-            HighRisk           = if ($_.RoleDefinitionName -in @('Owner','Contributor','User Access Administrator')) { 'YES' } else { 'No' }
-        })
-    }
+    Write-SubSection "Role Assignments (incl. classic administrators)"
+    try {
+        Get-AzRoleAssignment -IncludeClassicAdministrators -ErrorAction Stop | ForEach-Object {
+            $role    = "$($_.RoleDefinitionName)"
+            $scope   = "$($_.Scope)"
+            $isClassic = $role -match 'ServiceAdministrator|AccountAdministrator|CoAdministrator'
+            $isOwner = ($role -eq 'Owner') -or ($role -match 'ServiceAdministrator|AccountAdministrator')
+            $scopeLevel = if ($scope -eq '/' ) { 'Root' }
+                          elseif ($scope -match '^/providers/Microsoft\.Management/managementGroups/') { 'ManagementGroup' }
+                          elseif ($scope -match '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/') { 'Resource' }
+                          elseif ($scope -match '^/subscriptions/[^/]+/resourceGroups/[^/]+$') { 'ResourceGroup' }
+                          elseif ($scope -match '^/subscriptions/[^/]+$') { 'Subscription' }
+                          elseif ($isClassic) { 'Subscription' }
+                          else { 'Other' }
+            $null = $allRBAC.Add([PSCustomObject]@{
+                Subscription       = $subName
+                DisplayName        = $_.DisplayName
+                SignInName         = $_.SignInName
+                RoleDefinitionName = $role
+                Scope              = $scope
+                ObjectType         = $_.ObjectType
+                HighRisk           = if ($role -in @('Owner','Contributor','User Access Administrator') -or $isClassic) { 'YES' } else { 'No' }
+                ObjectId           = $_.ObjectId
+                RoleDefinitionId   = $_.RoleDefinitionId
+                ScopeLevel         = $scopeLevel
+                IsOwner            = $isOwner
+                IsClassicAdmin     = $isClassic
+                IsGuest            = ("$($_.SignInName)" -match '#EXT#')
+                IsOrphaned         = ("$($_.ObjectType)" -eq 'Unknown')
+            })
+        }
+    } catch { Write-SectionError $_ -Dataset '12_RoleAssignments.csv' }
 
     Write-SubSection "Custom Roles"
     Get-AzRoleDefinition -Custom -ErrorAction SilentlyContinue | ForEach-Object {
@@ -1049,7 +1640,7 @@ foreach ($sub in $subscriptions) {
                 DisplayName  = $_.DisplayName
                 Current      = $_.CurrentScore
                 Max          = $_.MaxScore
-                Percentage   = [math]::Round(($_.CurrentScore / $_.MaxScore) * 100, 1)
+                Percentage   = if ($_.MaxScore -gt 0) { [math]::Round(($_.CurrentScore / $_.MaxScore) * 100, 1) } else { $null }
             })
         }
     } catch { Write-SectionError $_ }
@@ -1072,6 +1663,7 @@ foreach ($sub in $subscriptions) {
     Get-AzResource -ResourceType 'Microsoft.KeyVault/vaults' -ErrorAction SilentlyContinue | ForEach-Object {
         $vault = Get-AzKeyVault -VaultName $_.Name -ResourceGroupName $_.ResourceGroupName -ErrorAction SilentlyContinue
         if ($vault) {
+        $kvAcl = $vault.NetworkAcls
         $null = $allKeyVaults.Add([PSCustomObject]@{
             Subscription    = $subName
             VaultName       = $vault.VaultName
@@ -1080,6 +1672,13 @@ foreach ($sub in $subscriptions) {
             SoftDelete      = $vault.EnableSoftDelete
             PurgeProtection = $vault.EnablePurgeProtection
             SKU             = $vault.Sku
+            ResourceId      = Get-FirstNonEmpty $vault.ResourceId $_.ResourceId
+            PublicNetworkAccess = Get-FirstNonEmpty $vault.PublicNetworkAccess 'Enabled'
+            NetworkDefaultAction = if ($kvAcl -and $kvAcl.DefaultAction) { "$($kvAcl.DefaultAction)" } else { 'Allow' }
+            IpRuleCount     = if ($kvAcl) { @($kvAcl.IpAddressRanges | Where-Object { $_ }).Count } else { 0 }
+            VNetRuleCount   = if ($kvAcl) { @($kvAcl.VirtualNetworkResourceIds | Where-Object { $_ }).Count } else { 0 }
+            RbacAuthorization = [bool]$vault.EnableRbacAuthorization
+            PrivateEndpointCount = $null
         })
 
         # Check for expiring secrets/certs
@@ -1125,42 +1724,66 @@ foreach ($sub in $subscriptions) {
                 })
             }
     } catch { Write-SectionError $_ }
-    Get-AzPolicyAssignment -ErrorAction SilentlyContinue | ForEach-Object {
-        $null = $allPolicyAssignments.Add([PSCustomObject]@{
-            Subscription    = $subName
-            Name            = $_.Name
-            DisplayName     = $_.Properties.DisplayName
-            Scope           = $_.Properties.Scope
-            EnforcementMode = $_.Properties.EnforcementMode
-        })
-    }
+    try {
+        # Az.Resources < 7 nests these under .Properties; 7+ exposes them at the top level
+        Get-AzPolicyAssignment -ErrorAction Stop | ForEach-Object {
+            $null = $allPolicyAssignments.Add([PSCustomObject]@{
+                Subscription    = $subName
+                Name            = $_.Name
+                DisplayName     = Get-PropValue $_ @('DisplayName', 'Properties.DisplayName')
+                Scope           = Get-PropValue $_ @('Scope', 'Properties.Scope')
+                EnforcementMode = Get-FirstNonEmpty (Get-PropValue $_ @('EnforcementMode', 'Properties.EnforcementMode')) 'Default'
+                PolicyDefinitionId = Get-PropValue $_ @('PolicyDefinitionId', 'Properties.PolicyDefinitionId')
+                Id              = Get-PropValue $_ @('Id', 'PolicyAssignmentId', 'ResourceId')
+            })
+        }
+    } catch { Write-SectionError $_ -Dataset '13_PolicyAssignments.csv' }
     #endregion
 
     #region ── 14. Cost & Advisor ─────────────────────────────────────────────
     Write-Section "14. Cost Optimization & Advisor"
     Write-SubSection "Advisor Recommendations"
     try {
-        $advisorRecs = Get-AzAdvisorRecommendation -ErrorAction SilentlyContinue
-        $advisorRecs | ForEach-Object {
-            $null = $allAdvisorAll.Add([PSCustomObject]@{
+        $advisorRecs = @(Get-AzAdvisorRecommendation -ErrorAction Stop)
+        foreach ($rec in $advisorRecs) {
+            # Az.Advisor 2.x flattens ShortDescription/ResourceMetadata; 1.x nests them
+            $resId   = Get-PropValue $rec @('ResourceMetadataResourceId', 'ResourceMetadata.ResourceId')
+            $annual  = Get-PropValue $rec @('ExtendedProperty.annualSavingsAmount', 'ExtendedProperties.annualSavingsAmount')
+            $monthly = Get-PropValue $rec @('ExtendedProperty.savingsAmount', 'ExtendedProperties.savingsAmount')
+            $row = [PSCustomObject]@{
                 Subscription = $subName
-                Category     = $_.Category
-                Impact       = $_.Impact
-                Problem      = $_.ShortDescription.Problem
-                Solution     = $_.ShortDescription.Solution
-                Resource     = if ($_.ResourceMetadata -and $_.ResourceMetadata.ResourceId) { $_.ResourceMetadata.ResourceId.Split('/')[-1] } else { $null }
-            })
+                Category     = $rec.Category
+                Impact       = $rec.Impact
+                Problem      = Get-PropValue $rec @('ShortDescriptionProblem', 'ShortDescription.Problem', 'Problem')
+                Solution     = Get-PropValue $rec @('ShortDescriptionSolution', 'ShortDescription.Solution', 'Solution')
+                Resource     = Get-FirstNonEmpty (Get-PropValue $rec @('ImpactedValue')) (Get-LastSegment $resId)
+                ResourceId   = $resId
+                ImpactedField = Get-PropValue $rec @('ImpactedField')
+                RecommendationTypeId = Get-PropValue $rec @('RecommendationTypeId')
+                AnnualSavings  = $annual
+                MonthlySavings = $monthly
+                SavingsCurrency = Get-PropValue $rec @('ExtendedProperty.savingsCurrency', 'ExtendedProperties.savingsCurrency')
+                LastUpdated  = Get-PropValue $rec @('LastUpdated')
+            }
+            $null = $allAdvisorAll.Add($row)
+            if ("$($rec.Category)" -eq 'Cost') {
+                $null = $allAdvisorCost.Add([PSCustomObject]@{
+                    Subscription = $subName
+                    Impact       = $row.Impact
+                    Problem      = $row.Problem
+                    Solution     = $row.Solution
+                    Resource     = $row.Resource
+                    ResourceId   = $row.ResourceId
+                    ImpactedField = $row.ImpactedField
+                    RecommendationTypeId = $row.RecommendationTypeId
+                    AnnualSavings  = $row.AnnualSavings
+                    MonthlySavings = $row.MonthlySavings
+                    SavingsCurrency = $row.SavingsCurrency
+                    LastUpdated  = $row.LastUpdated
+                })
+            }
         }
-        $advisorRecs | Where-Object { $_.Category -eq 'Cost' } | ForEach-Object {
-            $null = $allAdvisorCost.Add([PSCustomObject]@{
-                Subscription = $subName
-                Impact       = $_.Impact
-                Problem      = $_.ShortDescription.Problem
-                Solution     = $_.ShortDescription.Solution
-                Resource     = if ($_.ResourceMetadata -and $_.ResourceMetadata.ResourceId) { $_.ResourceMetadata.ResourceId.Split('/')[-1] } else { $null }
-            })
-        }
-    } catch { Write-SectionError $_ }
+    } catch { Write-SectionError $_ -Dataset '14_AdvisorAll.csv' }
 
     Write-SubSection "Consumption (Last 30 Days)"
     try {
@@ -1179,20 +1802,72 @@ foreach ($sub in $subscriptions) {
             }
     } catch { Write-SectionError $_ }
 
-    Write-SubSection "Reservations"
+    Write-SubSection "Actual Cost (Cost Management, $CostMonths full months + month to date)"
     try {
-        Get-AzReservation -ErrorAction SilentlyContinue | ForEach-Object {
-            $null = $allReservations.Add([PSCustomObject]@{
-                Subscription = $subName
-                DisplayName  = $_.DisplayName
-                SKU          = $_.Sku
-                Location     = $_.Location
-                Quantity     = $_.Quantity
-                ExpiryDate   = $_.ExpiryDate
-                Utilization  = $_.Utilization
+        $today    = (Get-Date).Date
+        $costFrom = $today.AddDays(1 - $today.Day).AddMonths(-$CostMonths)
+        $costBody = @{
+            type       = 'ActualCost'
+            timeframe  = 'Custom'
+            timePeriod = @{ from = $costFrom.ToString('yyyy-MM-ddT00:00:00Z'); to = $today.ToString('yyyy-MM-ddT23:59:59Z') }
+            dataset    = @{
+                granularity = 'Monthly'
+                aggregation = @{ totalCost = @{ name = 'Cost'; function = 'Sum' } }
+                grouping    = @(
+                    @{ type = 'Dimension'; name = 'ResourceId' },
+                    @{ type = 'Dimension'; name = 'ServiceName' }
+                )
+            }
+        }
+        $costPages = Invoke-ArmRest -Path "/subscriptions/$($sub.Id)/providers/Microsoft.CostManagement/query?api-version=2023-03-01" -Method POST -Body $costBody -FollowNextLink
+        if ($script:lastRestTruncated) {
+            Set-NotCollected -Dataset '14_ActualCostByResource.csv' -Reason "[$subName] cost query paging exceeded ${SectionTimeoutSeconds}s"
+            Set-NotCollected -Dataset '14_ActualCostByService.csv' -Reason "[$subName] cost query paging exceeded ${SectionTimeoutSeconds}s"
+        }
+        $subCostRows = [System.Collections.ArrayList]::new()
+        foreach ($pg in @($costPages)) {
+            if (-not $pg -or -not $pg.properties) { continue }
+            $colIdx = @{}
+            $cols = @($pg.properties.columns)
+            for ($i = 0; $i -lt $cols.Count; $i++) { $colIdx["$($cols[$i].name)"] = $i }
+            foreach ($r in @($pg.properties.rows)) {
+                if ($null -eq $r) { continue }
+                $rid   = if ($colIdx.ContainsKey('ResourceId')) { "$($r[$colIdx['ResourceId']])" } else { '' }
+                $month = if ($colIdx.ContainsKey('BillingMonth')) { "$($r[$colIdx['BillingMonth']])" } elseif ($colIdx.ContainsKey('UsageDate')) { "$($r[$colIdx['UsageDate']])" } else { '' }
+                if ($month -match '^(\d{4})-?(\d{2})') { $month = "$($Matches[1])-$($Matches[2])" }
+                $rg    = if ($rid -match '/resourcegroups/([^/]+)') { $Matches[1] } else { $null }
+                $rtype = if ($rid -match '/providers/([^/]+/[^/]+)/[^/]+') { $Matches[1] } else { $null }
+                $row = [PSCustomObject]@{
+                    Subscription  = $subName
+                    Month         = $month
+                    ResourceId    = $rid
+                    ResourceName  = Get-LastSegment $rid
+                    ResourceGroup = $rg
+                    ResourceType  = $rtype
+                    ServiceName   = if ($colIdx.ContainsKey('ServiceName')) { "$($r[$colIdx['ServiceName']])" } else { $null }
+                    Cost          = if ($colIdx.ContainsKey('Cost')) { [math]::Round([double]$r[$colIdx['Cost']], 2) } else { $null }
+                    Currency      = if ($colIdx.ContainsKey('Currency')) { "$($r[$colIdx['Currency']])" } else { $null }
+                }
+                $null = $subCostRows.Add($row)
+                $null = $allActualCostByResource.Add($row)
+            }
+        }
+        $subCostRows | Group-Object Month, ServiceName, Currency | ForEach-Object {
+            $first = $_.Group[0]
+            $null = $allActualCostByService.Add([PSCustomObject]@{
+                Subscription  = $subName
+                Month         = $first.Month
+                ServiceName   = $first.ServiceName
+                Cost          = [math]::Round(($_.Group | Measure-Object -Property Cost -Sum).Sum, 2)
+                Currency      = $first.Currency
+                ResourceCount = @($_.Group | Where-Object { $_.ResourceId } | Select-Object -ExpandProperty ResourceId -Unique).Count
             })
         }
-    } catch { Write-SectionError $_ }
+        Write-Host "    Actual cost rows: $($subCostRows.Count)" -ForegroundColor DarkGray
+    } catch {
+        Write-SectionError $_ -Context 'Cost Management query (needs Cost Management Reader; CSP subscriptions may return 401)' -Dataset '14_ActualCostByResource.csv'
+        Set-NotCollected -Dataset '14_ActualCostByService.csv' -Reason "[$subName] Cost Management query failed"
+    }
 
     Write-SubSection "Budgets"
     try {
@@ -1202,8 +1877,8 @@ foreach ($sub in $subscriptions) {
                 Name         = $_.Name
                 Amount       = $_.Amount
                 TimeGrain    = $_.TimeGrain
-                CurrentSpend = $_.CurrentSpend.Amount
-                Currency     = $_.CurrentSpend.Unit
+                CurrentSpend = if ($_.CurrentSpend) { $_.CurrentSpend.Amount } else { $null }
+                Currency     = if ($_.CurrentSpend) { $_.CurrentSpend.Unit } else { $null }
             })
         }
     } catch { Write-SectionError $_ }
@@ -1212,25 +1887,35 @@ foreach ($sub in $subscriptions) {
     #region ── 15. Backup & DR ────────────────────────────────────────────────
     Write-Section "15. Backup & Disaster Recovery"
     Write-SubSection "Recovery Services Vaults & Backup Items"
-    $vaults = Get-AzResource -ResourceType 'Microsoft.RecoveryServices/vaults' -ErrorAction SilentlyContinue | ForEach-Object {
-        Get-AzRecoveryServicesVault -ResourceGroupName $_.ResourceGroupName -Name $_.Name -ErrorAction SilentlyContinue
-    }
-    $backedUpVMNames = @()
-    foreach ($vault in $vaults) {
-        $null = $allRecoveryVaults.Add([PSCustomObject]@{
-            Subscription  = $subName
-            Name          = $vault.Name
-            ResourceGroup = $vault.ResourceGroupName
-            Location      = $vault.Location
+    if (-not (Test-CommandAvailable 'Get-AzRecoveryServicesBackupItem')) {
+        Set-NotCollected -Dataset '15_BackupItems.csv' -Reason 'Az.RecoveryServices not installed'
+        Set-NotCollected -Dataset '15_UnprotectedVMs.csv' -Reason 'Az.RecoveryServices not installed'
+    } else {
+        $vaults = @(Get-AzResource -ResourceType 'Microsoft.RecoveryServices/vaults' -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-AzRecoveryServicesVault -ResourceGroupName $_.ResourceGroupName -Name $_.Name -ErrorAction SilentlyContinue
         })
-        try {
-            Set-AzRecoveryServicesVaultContext -Vault $vault
-            $containers = Get-AzRecoveryServicesBackupContainer -ContainerType AzureVM -BackupManagementType AzureIaasVM -ErrorAction SilentlyContinue
-            foreach ($container in $containers) {
-                $items = Get-AzRecoveryServicesBackupItem -Container $container -WorkloadType AzureVM -ErrorAction SilentlyContinue
+        foreach ($vault in $vaults) {
+            if (-not $vault) { continue }
+            $null = $allRecoveryVaults.Add([PSCustomObject]@{
+                Subscription  = $subName
+                Name          = $vault.Name
+                ResourceGroup = $vault.ResourceGroupName
+                Location      = $vault.Location
+            })
+            try {
+                # Every Azure VM backup item in the vault (no container enumeration needed)
+                $items = @(Get-AzRecoveryServicesBackupItem -BackupManagementType AzureVM -WorkloadType AzureVM -VaultId $vault.ID -ErrorAction Stop)
                 foreach ($item in $items) {
-                    $vmName = $item.Name.Split(';')[-1]
-                    $backedUpVMNames += $vmName
+                    $parts   = "$($item.Name)" -split ';'
+                    $vmName  = $parts[-1]
+                    $vmRg    = if ($parts.Count -ge 2) { $parts[-2] } else { $null }
+                    $srcId   = Get-FirstNonEmpty $item.SourceResourceId $item.VirtualMachineId
+                    if ($srcId) {
+                        $protectedVmIds["$srcId".ToLower()] = $vault.Name
+                        $vmName = Get-LastSegment $srcId
+                        if ("$srcId" -match '/resourceGroups/([^/]+)/') { $vmRg = $Matches[1] }
+                    }
+                    $protectedVmNames["$subName|$vmRg|$vmName".ToLower()] = $vault.Name
                     $null = $allBackupItems.Add([PSCustomObject]@{
                         Subscription       = $subName
                         Vault              = $vault.Name
@@ -1238,21 +1923,21 @@ foreach ($sub in $subscriptions) {
                         ProtectionStatus   = $item.ProtectionStatus
                         LastBackup         = $item.LastBackupTime
                         LatestRecoveryPoint = $item.LatestRecoveryPoint
+                        ResourceGroup      = $vmRg
+                        ResourceId         = $srcId
+                        ProtectionState    = $item.ProtectionState
+                        LastBackupStatus   = $item.LastBackupStatus
+                        PolicyName         = $item.ProtectionPolicyName
                     })
                 }
+            } catch {
+                Write-SectionError $_ -Context "Backup items: $($vault.Name)" -Dataset '15_BackupItems.csv'
+                $backupFailedSubs[$subName] = $true
+                Set-NotCollected -Dataset '15_UnprotectedVMs.csv' -Reason "[$subName] backup items for vault $($vault.Name) could not be read"
             }
-        } catch { Write-SectionError $_ }
+        }
     }
-
-    # Unprotected VMs
-    $vmNames = ($vms | Select-Object -ExpandProperty Name)
-    $vmNames | Where-Object { $_ -notin $backedUpVMNames } | ForEach-Object {
-        $null = $allUnprotectedVMs.Add([PSCustomObject]@{
-            Subscription = $subName
-            VM           = $_
-            Status       = 'NO BACKUP CONFIGURED'
-        })
-    }
+    # Unprotected VMs are computed after all subscriptions are processed
     #endregion
 
     #region ── 16. Monitoring ─────────────────────────────────────────────────
@@ -1267,7 +1952,7 @@ foreach ($sub in $subscriptions) {
                 ResourceGroup = $ws.ResourceGroupName
                 SKU           = $ws.Sku
                 RetentionDays = $ws.RetentionInDays
-                DailyCapGB    = $ws.WorkspaceCapping.DailyQuotaGb
+                DailyCapGB    = if ($ws.WorkspaceCapping) { $ws.WorkspaceCapping.DailyQuotaGb } else { $null }
             })
         }
     }
@@ -1283,60 +1968,109 @@ foreach ($sub in $subscriptions) {
         'Microsoft.Network/azureFirewalls',
         'Microsoft.ContainerService/managedClusters'
     )
-    Get-AzResource -ErrorAction SilentlyContinue | Where-Object {
-        $_.ResourceType -in $criticalTypes
+    @($resources) | Where-Object {
+        $_ -and $_.ResourceType -in $criticalTypes
     } | ForEach-Object {
-        $diag = Get-AzDiagnosticSetting -ResourceId $_.ResourceId -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+        $diag = @(Get-AzDiagnosticSetting -ResourceId $_.ResourceId -WarningAction SilentlyContinue -ErrorAction SilentlyContinue | Where-Object { $_ })
+        $dest = @(foreach ($d in $diag) {
+            Get-LastSegment $d.WorkspaceId
+            Get-LastSegment $d.StorageAccountId
+            if ($d.EventHubAuthorizationRuleId) { "EventHub:$(Get-LastSegment $d.EventHubName)" }
+        }) | Where-Object { $_ }
         $null = $allDiagSettings.Add([PSCustomObject]@{
             Subscription   = $subName
             Resource       = $_.Name
-            Type           = $_.ResourceType.Split('/')[-1]
-            HasDiagnostics = [bool]$diag
-            Destinations   = if ($diag) { ($diag.WorkspaceId | ForEach-Object { $_.Split('/')[-1] }) -join ', ' } else { 'NONE' }
+            Type           = Get-LastSegment $_.ResourceType
+            HasDiagnostics = $diag.Count -gt 0
+            Destinations   = if ($diag.Count -gt 0) { Join-Values $dest -Separator ', ' } else { 'NONE' }
         })
     }
 
-    Write-SubSection "Alert Rules"
-    try {
-        Get-AzResource -ResourceType 'Microsoft.Insights/metricAlerts' -ErrorAction SilentlyContinue | ForEach-Object {
-            $alert = Get-AzMetricAlertRuleV2 -ResourceGroupName $_.ResourceGroupName -Name $_.Name -ErrorAction SilentlyContinue
-            if ($alert) {
+    Write-SubSection "Alert Rules (metric, log search, activity log, smart detector)"
+    $alertTypes = [ordered]@{
+        'Microsoft.Insights/metricAlerts'            = 'Metric'
+        'Microsoft.Insights/scheduledQueryRules'     = 'LogSearch'
+        'Microsoft.Insights/activityLogAlerts'       = 'ActivityLog'
+        'Microsoft.AlertsManagement/smartDetectorAlertRules' = 'SmartDetector'
+    }
+    foreach ($at in $alertTypes.Keys) {
+        try {
+            Get-AzResource -ResourceType $at -ExpandProperties -ErrorAction Stop | ForEach-Object {
+                $p = $_.Properties
+                # scheduledQueryRules: 2021+ shape (scopes/actions.actionGroups) or 2018 shape (source/action.aznsAction)
+                $scopes = @(
+                    Get-PropValue $p @('scopes', 'scope')
+                    Get-PropValue $p @('source.dataSourceId')
+                ) | ForEach-Object { $_ } | Where-Object { $_ }
+                $agIds = @(
+                    @(Get-PropValue $p @('actions')) | ForEach-Object { if ($_ -isnot [string]) { Get-PropValue $_ @('actionGroupId') } }
+                    Get-PropValue $p @('actions.actionGroups')
+                    @(Get-PropValue $p @('actions.actionGroups')) | ForEach-Object { if ($_ -isnot [string]) { Get-PropValue $_ @('actionGroupId') } }
+                    Get-PropValue $p @('action.aznsAction.actionGroup')
+                    Get-PropValue $p @('actionGroups.groupIds')
+                ) | ForEach-Object { $_ } | Where-Object { $_ -is [string] -and $_ -match '/actionGroups/' } | Select-Object -Unique
+                $enabledRaw = Get-PropValue $p @('enabled', 'state')
+                $sev = Get-PropValue $p @('severity', 'action.severity')
                 $null = $allAlertRules.Add([PSCustomObject]@{
                     Subscription  = $subName
-                    Name          = $alert.Name
-                    ResourceGroup = $alert.ResourceGroupName
-                    Severity      = $alert.Severity
-                    Enabled       = $alert.Enabled
-                    TargetResource = $alert.TargetResourceId.Split('/')[-1]
+                    Name          = $_.Name
+                    ResourceGroup = $_.ResourceGroupName
+                    Severity      = $sev
+                    Enabled       = if ($null -eq $enabledRaw) { $null } else { "$enabledRaw" -match '^(true|enabled)$' }
+                    TargetResource = Join-Values @($scopes | ForEach-Object { Get-LastSegment $_ }) -Separator ', '
+                    AlertType     = $alertTypes[$at]
+                    Scopes        = Join-Values $scopes -Separator '; '
+                    ActionGroupCount = @($agIds).Count
+                    ActionGroups  = Join-Values @($agIds | ForEach-Object { Get-LastSegment $_ }) -Separator ', '
+                    ResourceId    = $_.ResourceId
                 })
             }
-        }
-    } catch { Write-SectionError $_ }
+        } catch { Write-SectionError $_ -Context "Alert rules: $at" -Dataset '16_AlertRules.csv' }
+    }
 
     Write-SubSection "Action Groups"
     try {
-        Get-AzResource -ResourceType 'Microsoft.Insights/actionGroups' -ErrorAction SilentlyContinue | ForEach-Object {
-            $ag = Get-AzActionGroup -ResourceGroupName $_.ResourceGroupName -Name $_.Name -ErrorAction SilentlyContinue
-            if ($ag) {
-                $null = $allActionGroups.Add([PSCustomObject]@{
-                    Subscription  = $subName
-                    Name          = $ag.Name
-                    ResourceGroup = $ag.ResourceGroupName
-                    Enabled       = $ag.Enabled
-                    EmailReceivers = ($ag.EmailReceivers.Name -join ', ')
-                    SMSReceivers   = ($ag.SmsReceivers.Name -join ', ')
-                    WebhookReceivers = ($ag.WebhookReceivers.Name -join ', ')
-                })
+        Get-AzResource -ResourceType 'Microsoft.Insights/actionGroups' -ExpandProperties -ErrorAction Stop | ForEach-Object {
+            $res = $_
+            $ag = $null
+            try { $ag = Get-AzActionGroup -ResourceGroupName $res.ResourceGroupName -Name $res.Name -ErrorAction Stop } catch {}
+            # Az.Monitor 5 uses singular property names (EmailReceiver); older versions and ARM use plural
+            $getRecv = {
+                param([string]$Kind)
+                $v = Get-PropValue $ag @("${Kind}Receiver", "${Kind}Receivers")
+                if ($null -eq $v) { $v = Get-PropValue $res @("Properties.${Kind}Receivers") }
+                return ,@($v | Where-Object { $_ })
             }
+            $email   = & $getRecv 'Email'
+            $sms     = & $getRecv 'Sms'
+            $webhook = & $getRecv 'Webhook'
+            $total = 0
+            foreach ($k in @('Email','Sms','Webhook','Voice','AzureAppPush','ArmRole','AzureFunction','LogicApp','AutomationRunbook','Itsm','EventHub')) {
+                $total += (& $getRecv $k).Count
+            }
+            $enabled = Get-FirstNonEmpty $(if ($ag) { $ag.Enabled }) (Get-PropValue $res @('Properties.enabled'))
+            $null = $allActionGroups.Add([PSCustomObject]@{
+                Subscription  = $subName
+                Name          = $res.Name
+                ResourceGroup = $res.ResourceGroupName
+                Enabled       = $enabled
+                EmailReceivers = Join-Values @($email | ForEach-Object { Get-PropValue $_ @('Name') }) -Separator ', '
+                SMSReceivers   = Join-Values @($sms | ForEach-Object { Get-PropValue $_ @('Name') }) -Separator ', '
+                WebhookReceivers = Join-Values @($webhook | ForEach-Object { Get-PropValue $_ @('Name') }) -Separator ', '
+                EmailReceiverCount   = $email.Count
+                SmsReceiverCount     = $sms.Count
+                WebhookReceiverCount = $webhook.Count
+                TotalReceivers       = $total
+                ResourceId    = $res.ResourceId
+            })
         }
-    } catch { Write-SectionError $_ }
+    } catch { Write-SectionError $_ -Dataset '16_ActionGroups.csv' }
     #endregion
-
     #region ── 17. Governance & Tags ──────────────────────────────────────────
     Write-Section "17. Governance & Tagging"
     Write-SubSection "Tag Compliance"
     $requiredTags = @('Environment', 'Owner', 'CostCenter', 'Application')
-    Get-AzResource -ErrorAction SilentlyContinue | ForEach-Object {
+    @($resources) | Where-Object { $_ } | ForEach-Object {
         $resource = $_
         $missing = $requiredTags | Where-Object {
             -not ($resource.Tags -and $resource.Tags.ContainsKey($_))
@@ -1345,23 +2079,28 @@ foreach ($sub in $subscriptions) {
             $null = $allTagCompliance.Add([PSCustomObject]@{
                 Subscription = $subName
                 Resource     = $resource.Name
-                Type         = $resource.ResourceType.Split('/')[-1]
+                Type         = Get-LastSegment $resource.ResourceType
                 MissingTags  = ($missing -join ', ')
+                ResourceGroup = $resource.ResourceGroupName
+                ResourceId   = $resource.ResourceId
             })
         }
     }
 
     Write-SubSection "Resource Locks"
-    Get-AzResourceLock -ErrorAction SilentlyContinue | ForEach-Object {
-        $null = $allResourceLocks.Add([PSCustomObject]@{
-            Subscription  = $subName
-            Name          = $_.Name
-            ResourceGroup = $_.ResourceGroupName
-            LockLevel     = $_.Properties.Level
-            Resource      = $_.ResourceId.Split('/')[-1]
-            Notes         = $_.Properties.Notes
-        })
-    }
+    try {
+        Get-AzResourceLock -ErrorAction Stop | ForEach-Object {
+            $null = $allResourceLocks.Add([PSCustomObject]@{
+                Subscription  = $subName
+                Name          = $_.Name
+                ResourceGroup = $_.ResourceGroupName
+                LockLevel     = Get-PropValue $_ @('Properties.Level', 'Level')
+                Resource      = Get-LastSegment ("$($_.ResourceId)" -replace '/providers/Microsoft\.Authorization/locks/[^/]+$', '')
+                Notes         = Get-PropValue $_ @('Properties.Notes', 'Notes')
+                ResourceId    = $_.ResourceId
+            })
+        }
+    } catch { Write-SectionError $_ -Dataset '17_ResourceLocks.csv' }
     #endregion
 
     #region ── 18. Automation & Hybrid ────────────────────────────────────────
@@ -1400,6 +2139,11 @@ foreach ($sub in $subscriptions) {
     #endregion
 
 } # End subscription loop
+Complete-SectionTiming
+$script:currentSubName = $null
+$subIds = @($subscriptions | ForEach-Object { $_.Id })
+$subNameById = @{}
+foreach ($s in $subscriptions) { $subNameById["$($s.Id)".ToLower()] = $s.Name }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MANAGEMENT GROUPS (tenant-level, outside sub loop)
@@ -1414,6 +2158,281 @@ try {
         })
     }
 } catch { Write-SectionError $_ }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TENANT-LEVEL / CROSS-SUBSCRIPTION COLLECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+Write-Section "20. Reservations"
+# Reservations live at tenant (billing) scope, not under a subscription
+try {
+    $resRows = @()
+    $useCmdlet = $false
+    $resCmd = Get-Command Get-AzReservation -ErrorAction SilentlyContinue
+    if ($resCmd) {
+        foreach ($ps in $resCmd.ParameterSets) {
+            if (-not @($ps.Parameters | Where-Object { $_.IsMandatory }).Count) { $useCmdlet = $true; break }
+        }
+    }
+    if ($useCmdlet) {
+        $resRows = @(Get-AzReservation -ErrorAction Stop)
+    } else {
+        $pages = Invoke-ArmRest -Path '/providers/Microsoft.Capacity/reservations?api-version=2022-11-01' -FollowNextLink
+        $resRows = @(foreach ($pg in @($pages)) { if ($pg) { @($pg.value) } })
+        if ($script:lastRestTruncated) { Set-NotCollected -Dataset '14_Reservations.csv' -Reason "Reservation paging exceeded ${SectionTimeoutSeconds}s" }
+    }
+    foreach ($r in $resRows) {
+        if (-not $r) { continue }
+        $rid = Get-PropValue $r @('Id')
+        $orderId = if ("$rid" -match '/reservationOrders/([^/]+)') { $Matches[1] } else { Get-PropValue $r @('ReservationOrderId') }
+        $scopes = @(Get-PropValue $r @('Properties.appliedScopes', 'AppliedScopes', 'Properties.appliedScopeProperties.resourceGroupId', 'Properties.appliedScopeProperties.subscriptionId', 'Properties.appliedScopeProperties.managementGroupId'))
+        $scopeSub = $null
+        foreach ($sc in $scopes) { if ("$sc" -match '/subscriptions/([^/]+)') { $scopeSub = $subNameById["$($Matches[1])".ToLower()]; if (-not $scopeSub) { $scopeSub = $Matches[1] }; break } }
+        $util = Get-PropValue $r @('Properties.utilization.aggregates', 'Utilization.Aggregates')
+        $u = @{}
+        foreach ($a in @($util)) {
+            $g = "$(Get-PropValue $a @('grain'))"; $v = Get-PropValue $a @('value')
+            if ($g) { $u[$g] = $v }
+        }
+        $null = $allReservations.Add([PSCustomObject]@{
+            Subscription  = Get-FirstNonEmpty $scopeSub $(if ("$(Get-PropValue $r @('Properties.appliedScopeType','AppliedScopeType'))" -eq 'Shared') { 'Shared' })
+            DisplayName   = Get-PropValue $r @('Properties.displayName', 'DisplayName', 'Name')
+            SKU           = Get-PropValue $r @('Sku.name', 'SkuName', 'Sku')
+            Location      = Get-PropValue $r @('Location')
+            Quantity      = Get-PropValue $r @('Properties.quantity', 'Quantity')
+            ExpiryDate    = Get-PropValue $r @('Properties.expiryDateTime', 'Properties.expiryDate', 'ExpiryDateTime', 'ExpiryDate')
+            Utilization   = Get-FirstNonEmpty $u['30.0'] $u['30'] $u['7.0'] $u['7'] $u['1.0'] $u['1']
+            ReservationOrderId = $orderId
+            ReservationId = Get-LastSegment $rid
+            AppliedScopeType = Get-PropValue $r @('Properties.appliedScopeType', 'AppliedScopeType')
+            Scope         = Join-Values $scopes -Separator '; '
+            Term          = Get-PropValue $r @('Properties.term', 'Term')
+            ProvisioningState = Get-PropValue $r @('Properties.provisioningState', 'ProvisioningState')
+            ReservedResourceType = Get-PropValue $r @('Properties.reservedResourceType', 'ReservedResourceType')
+            Utilization1d  = Get-FirstNonEmpty $u['1.0'] $u['1']
+            Utilization7d  = Get-FirstNonEmpty $u['7.0'] $u['7']
+            Utilization30d = Get-FirstNonEmpty $u['30.0'] $u['30']
+            UtilizationTrend = Get-PropValue $r @('Properties.utilization.trend', 'Utilization.Trend')
+        })
+    }
+    Write-Host "    Reservations: $(@($allReservations).Count)" -ForegroundColor DarkGray
+} catch {
+    Write-SectionError $_ -Context 'Reservations (needs Reservations Reader or an Owner/Reader role on the reservation orders)' -Dataset '14_Reservations.csv'
+}
+
+Write-Section "21. Guest Users"
+try {
+    $guestRbac = @{}
+    foreach ($ra in $allRBAC) { if ($ra.ObjectId) { $guestRbac["$($ra.ObjectId)"] = 1 + [int]$guestRbac["$($ra.ObjectId)"] } }
+    $guests = @(Get-AzADUser -Filter "userType eq 'Guest'" -ErrorAction Stop)
+    foreach ($g in $guests) {
+        $gid = "$($g.Id)"
+        $null = $allGuestUsers.Add([PSCustomObject]@{
+            DisplayName       = $g.DisplayName
+            UserPrincipalName = $g.UserPrincipalName
+            Mail              = $g.Mail
+            ObjectId          = $gid
+            AccountEnabled    = $g.AccountEnabled
+            HasAzureRoleAssignment = $guestRbac.ContainsKey($gid)
+            AzureRoleAssignmentCount = [int]$guestRbac[$gid]
+        })
+    }
+    # Back-fill IsGuest on role assignments whose principal is a known guest
+    $guestIds = @{}; foreach ($g in $guests) { $guestIds["$($g.Id)"] = $true }
+    foreach ($ra in $allRBAC) { if ($ra.ObjectId -and $guestIds.ContainsKey("$($ra.ObjectId)")) { $ra.IsGuest = $true } }
+    Write-Host "    Guest users: $($guests.Count)" -ForegroundColor DarkGray
+} catch {
+    Write-SectionError $_ -Context 'Guest users (needs directory read: User.Read.All or Directory Readers)' -Dataset '12_GuestUsers.csv'
+}
+
+Write-Section "22. Managed Identities"
+$miQuery = @"
+resources
+| where isnotempty(identity) and tostring(identity.type) != 'None'
+| project subscriptionId, name, type, resourceGroup, id,
+          identityType = tostring(identity.type),
+          principalId = tostring(identity.principalId),
+          userAssigned = identity.userAssignedIdentities
+"@
+foreach ($row in @(Invoke-ResourceGraphQuery -Query $miQuery -Subscriptions $subIds -Dataset '12_ManagedIdentities.csv')) {
+    $ua = @()
+    if ($row.userAssigned) { $ua = @($row.userAssigned.PSObject.Properties | ForEach-Object { Get-LastSegment $_.Name }) }
+    $null = $allManagedIdentities.Add([PSCustomObject]@{
+        Subscription  = Get-FirstNonEmpty $subNameById["$($row.subscriptionId)".ToLower()] $row.subscriptionId
+        Name          = $row.name
+        ResourceType  = $row.type
+        ResourceGroup = $row.resourceGroup
+        ResourceId    = $row.id
+        IdentityType  = $row.identityType
+        PrincipalId   = $row.principalId
+        UserAssignedIdentities = Join-Values $ua -Separator '; '
+    })
+}
+$uaQuery = @"
+resources
+| where type =~ 'microsoft.managedidentity/userassignedidentities'
+| project subscriptionId, name, resourceGroup, id,
+          principalId = tostring(properties.principalId),
+          clientId = tostring(properties.clientId)
+"@
+foreach ($row in @(Invoke-ResourceGraphQuery -Query $uaQuery -Subscriptions $subIds -Dataset '12_UserAssignedIdentities.csv')) {
+    $null = $allUserAssignedIds.Add([PSCustomObject]@{
+        Subscription  = Get-FirstNonEmpty $subNameById["$($row.subscriptionId)".ToLower()] $row.subscriptionId
+        Name          = $row.name
+        ResourceGroup = $row.resourceGroup
+        ResourceId    = $row.id
+        PrincipalId   = $row.principalId
+        ClientId      = $row.clientId
+    })
+}
+
+Write-Section "23. Defender for Cloud Recommendations"
+$defQuery = @"
+securityresources
+| where type == 'microsoft.security/assessments'
+| where tostring(properties.status.code) == 'Unhealthy'
+| extend resId = tostring(properties.resourceDetails.Id)
+| project subscriptionId, name,
+          recommendation = tostring(properties.displayName),
+          severity = tostring(properties.metadata.severity),
+          categories = properties.metadata.categories,
+          resId,
+          statusCause = tostring(properties.status.cause),
+          statusDescription = tostring(properties.status.description),
+          remediation = tostring(properties.metadata.remediationDescription)
+"@
+foreach ($row in @(Invoke-ResourceGraphQuery -Query $defQuery -Subscriptions $subIds -Dataset '13_DefenderRecommendations.csv')) {
+    $rtype = if ("$($row.resId)" -match '/providers/([^/]+/[^/]+)/[^/]+') { $Matches[1] } elseif ("$($row.resId)" -match '/resourceGroups/[^/]+$') { 'resourceGroup' } elseif ("$($row.resId)" -match '^/subscriptions/[^/]+$') { 'subscription' } else { $null }
+    $null = $allDefenderRecs.Add([PSCustomObject]@{
+        Subscription      = Get-FirstNonEmpty $subNameById["$($row.subscriptionId)".ToLower()] $row.subscriptionId
+        Recommendation    = $row.recommendation
+        Severity          = $row.severity
+        Category          = Join-Values $row.categories -Separator ', '
+        ResourceId        = $row.resId
+        ResourceName      = Get-LastSegment $row.resId
+        ResourceType      = $rtype
+        AssessmentKey     = $row.name
+        StatusCause       = $row.statusCause
+        StatusDescription = $row.statusDescription
+        Remediation       = $row.remediation
+    })
+}
+Write-Host "    Unhealthy assessments: $(@($allDefenderRecs).Count)" -ForegroundColor DarkGray
+
+Write-Section "24. Cross-references"
+# Private endpoint counts on data services
+foreach ($list in @($allStorageAccounts, $allKeyVaults, $allSQLServers)) {
+    foreach ($row in $list) {
+        $k = "$($row.ResourceId)".ToLower()
+        $row.PrivateEndpointCount = if ($k -and $privateEndpointTargets.ContainsKey($k)) { [int]$privateEndpointTargets[$k] } else { 0 }
+    }
+}
+
+# VMs with no Azure Backup protection in any vault of any assessed subscription
+# (subscriptions where backup items could not be read are skipped and the file is marked Partial)
+if (Test-CommandAvailable 'Get-AzRecoveryServicesBackupItem') {
+    foreach ($vm in $allVMs) {
+        if ($backupFailedSubs.ContainsKey("$($vm.Subscription)")) { continue }
+        $idKey   = "$($vm.ResourceId)".ToLower()
+        $nameKey = "$($vm.Subscription)|$($vm.ResourceGroup)|$($vm.Name)".ToLower()
+        if ($protectedVmIds.ContainsKey($idKey) -or $protectedVmNames.ContainsKey($nameKey)) { continue }
+        $null = $allUnprotectedVMs.Add([PSCustomObject]@{
+            Subscription  = $vm.Subscription
+            VM            = $vm.Name
+            Status        = 'NO BACKUP CONFIGURED'
+            ResourceGroup = $vm.ResourceGroup
+            ResourceId    = $vm.ResourceId
+            PowerState    = $vm.PowerState
+        })
+    }
+}
+Complete-SectionTiming
+
+# Column schema per CSV. Rows are written in this column order (extra properties follow);
+# empty datasets get a header-only file. The analyzer keys on these names: add columns, never rename.
+$Schemas = @{
+    '01_ResourceInventory.csv'         = @('Subscription','ResourceType','Count')
+    '02_VMs.csv'                       = @('Subscription','Name','ResourceGroup','Location','VMSize','OsType','PowerState','AvailabilityZone','DiskEncryption','ResourceId','LicenseType','SecurityType','EncryptionAtHost','OsDiskEncryptionType','DataDiskEncryptionTypes','ADEExtension','DeallocatedSinceUtc','DeallocatedDays','DeallocatedOver90Days')
+    '02_VM_Metrics.csv'                = @('Subscription','VM','VMSize','AvgCPU','PeakCPU','Recommendation','ResourceGroup','ResourceId','MemoryGB','AvgAvailableMemoryGB','MinAvailableMemoryGB','AvgMemoryUsedPct','PeakMemoryUsedPct','AvgOsDiskIopsPct','PeakOsDiskIopsPct','AvgDataDiskIopsPct','PeakDataDiskIopsPct')
+    '02_VMScaleSets.csv'               = @('Subscription','Name','ResourceGroup','Location','SKU','Capacity','UpgradePolicy','Zones')
+    '03_AppServicePlans.csv'           = @('Subscription','Name','ResourceGroup','Location','SKU','Tier','Workers','AppCount','Apps','Status')
+    '03_WebApps.csv'                   = @('Subscription','Name','ResourceGroup','Plan','State','HttpsOnly','MinTlsVersion','AlwaysOn','Runtime','Kind','ResourceId','FtpsState','PublicNetworkAccess')
+    '04_Functions.csv'                 = @('Subscription','Name','ResourceGroup','State','Runtime','HttpsOnly','Plan','Kind','MinTlsVersion','ResourceId')
+    '05_LogicApps.csv'                 = @('Subscription','Name','ResourceGroup','Location','State','ResourceId')
+    '06_Disks.csv'                     = @('Subscription','Name','ResourceGroup','AttachedTo','DiskSizeGB','SKU','IOPS','ThroughputMBps','Encryption','Location','CreatedDate','EncryptionType','DiskState','ResourceId')
+    '06_UnattachedDisks.csv'           = @('Subscription','Name','ResourceGroup','AttachedTo','DiskSizeGB','SKU','IOPS','ThroughputMBps','Encryption','Location','CreatedDate','EncryptionType','DiskState','ResourceId')
+    '06_Snapshots.csv'                 = @('Subscription','Name','ResourceGroup','DiskSizeGB','AgeDays','CreatedDate','Recommendation')
+    '06_StorageAccounts.csv'           = @('Subscription','Name','ResourceGroup','SKU','Kind','AccessTier','HttpsOnly','MinTLS','PublicAccess','Location','ResourceId','PublicNetworkAccess','NetworkDefaultAction','IpRuleCount','VNetRuleCount','AllowSharedKeyAccess','PrivateEndpointCount')
+    '06_FileShares.csv'                = @('Subscription','StorageAccount','ShareName','QuotaGB','AccessTier','ResourceGroup','EnabledProtocols')
+    '07_VNets_Subnets.csv'             = @('Subscription','VNet','AddressSpace','Subnet','SubnetPrefix','NSG','RouteTable')
+    '07_OrphanedPublicIPs.csv'         = @('Subscription','Name','ResourceGroup','IpAddress','SKU','Allocation','ResourceId','Location')
+    '07_OpenNSGRules.csv'              = @('Subscription','NSG','Rule','Priority','DestPort','Source','Severity','ResourceGroup','Protocol','DestinationAddress')
+    '07_LoadBalancers.csv'             = @('Subscription','Name','ResourceGroup','SKU','FrontendIPs','BackendPools','Rules')
+    '07_AppGateways.csv'               = @('Subscription','Name','ResourceGroup','Tier','Capacity','WAFEnabled')
+    '07_AzureFirewalls.csv'            = @('Subscription','Name','ResourceGroup','SKU','ThreatIntel','ProvisionState')
+    '07_FrontDoors.csv'                = @('Subscription','Name','ResourceGroup','Location','Kind')
+    '07_Bastions.csv'                  = @('Subscription','Name','ResourceGroup','Location')
+    '07_NATGateways.csv'               = @('Subscription','Name','ResourceGroup','Location','IdleTimeoutMinutes','PublicIpCount')
+    '07_VPNGateways.csv'               = @('Subscription','Name','ResourceGroup','SKU','GatewayType','VpnType','ActiveActive')
+    '07_ExpressRoute.csv'              = @('Subscription','Name','SKU','Tier','Bandwidth','Provider','State')
+    '07_VNetPeerings.csv'              = @('Subscription','VNet','PeeringName','RemoteVNet','State','AllowForwarded','AllowGatewayTransit','UseRemoteGateway')
+    '07_PrivateEndpoints.csv'          = @('Subscription','Name','ResourceGroup','Subnet','PrivateLinkService','TargetResourceId','GroupIds','ConnectionState')
+    '07_PrivateDNS.csv'                = @('Subscription','Name','ResourceGroup','RecordSets','VNetLinks')
+    '07_PublicDNS.csv'                 = @('Subscription','Name','ResourceGroup','RecordSets','NameServers')
+    '07_NetworkWatchers.csv'           = @('Subscription','Name','ResourceGroup','Location','ProvisioningState')
+    '07_CDNProfiles.csv'               = @('Subscription','Name','ResourceGroup','Location','SKU')
+    '08_SQLServers.csv'                = @('Subscription','ServerName','ResourceGroup','Location','AdminLogin','Version','ResourceId','PublicNetworkAccess','MinimalTlsVersion','EntraOnlyAuth','EntraAdmin','AuditingEnabled','AuditDestinations','AllowAzureServices','OpenToInternet','FirewallRuleCount','PrivateEndpointCount')
+    '08_SQLDatabases.csv'              = @('Subscription','Server','Database','Edition','ServiceObjective','MaxSizeGB','Status','ZoneRedundant','ResourceGroup','TDE','ElasticPool','ResourceId')
+    '08_SQLManagedInstances.csv'       = @('Subscription','Name','ResourceGroup','SKU','vCores','StorageGB','LicenseType','State')
+    '08_CosmosDB.csv'                  = @('Subscription','Name','ResourceGroup','Kind','ConsistencyLevel','MultipleWriteLocations','Locations')
+    '08_MySQL.csv'                     = @('Subscription','Name','ResourceGroup','SKU','Tier','StorageGB','Version','State','Location','PublicNetworkAccess','HighAvailability','BackupRetentionDays','GeoRedundantBackup','ResourceId')
+    '08_PostgreSQL.csv'                = @('Subscription','Name','ResourceGroup','SKU','Tier','StorageGB','Version','State','Location','PublicNetworkAccess','HighAvailability','BackupRetentionDays','GeoRedundantBackup','ResourceId')
+    '08_RedisCache.csv'                = @('Subscription','Name','ResourceGroup','SKU','Size','ShardCount','NonSslPort','MinTLS','Location')
+    '09_ServiceBus.csv'                = @('Subscription','Name','ResourceGroup','Location','SKU')
+    '09_EventHubs.csv'                 = @('Subscription','Name','ResourceGroup','Location','SKU')
+    '09_APIM.csv'                      = @('Subscription','Name','ResourceGroup','Location','SKU')
+    '10_AKS_Clusters.csv'              = @('Subscription','Name','ResourceGroup','K8sVersion','NodePools','NetworkPlugin','NetworkPolicy','RBAC')
+    '10_AKS_NodePools.csv'             = @('Subscription','Cluster','Pool','VMSize','Count','MinCount','MaxCount','AutoScale','OsType','Mode')
+    '10_ContainerInstances.csv'        = @('Subscription','Name','ResourceGroup','Location')
+    '10_ContainerApps.csv'             = @('Subscription','Name','ResourceGroup','Location')
+    '10_ContainerRegistries.csv'       = @('Subscription','Name','ResourceGroup','SKU','AdminEnabled','LoginServer','Location')
+    '11_DataFactories.csv'             = @('Subscription','Name','ResourceGroup','Location')
+    '12_RoleAssignments.csv'           = @('Subscription','DisplayName','SignInName','RoleDefinitionName','Scope','ObjectType','HighRisk','ObjectId','RoleDefinitionId','ScopeLevel','IsOwner','IsClassicAdmin','IsGuest','IsOrphaned')
+    '12_HighRiskRoles.csv'             = @('Subscription','DisplayName','SignInName','RoleDefinitionName','Scope','ObjectType','HighRisk','ObjectId','RoleDefinitionId','ScopeLevel','IsOwner','IsClassicAdmin','IsGuest','IsOrphaned')
+    '12_CustomRoles.csv'               = @('Subscription','Name','Description','Actions','AssignableScopes')
+    '12_ManagementGroups.csv'          = @('Name','DisplayName','Id')
+    '12_GuestUsers.csv'                = @('DisplayName','UserPrincipalName','Mail','ObjectId','AccountEnabled','HasAzureRoleAssignment','AzureRoleAssignmentCount')
+    '12_ManagedIdentities.csv'         = @('Subscription','Name','ResourceType','ResourceGroup','ResourceId','IdentityType','PrincipalId','UserAssignedIdentities')
+    '12_UserAssignedIdentities.csv'    = @('Subscription','Name','ResourceGroup','ResourceId','PrincipalId','ClientId')
+    '13_DefenderPricing.csv'           = @('Subscription','Plan','PricingTier')
+    '13_SecureScore.csv'               = @('Subscription','DisplayName','Current','Max','Percentage')
+    '13_SecurityAlerts.csv'            = @('Subscription','Alert','Severity','Resource','StartTime')
+    '13_KeyVaults.csv'                 = @('Subscription','VaultName','ResourceGroup','Location','SoftDelete','PurgeProtection','SKU','ResourceId','PublicNetworkAccess','NetworkDefaultAction','IpRuleCount','VNetRuleCount','RbacAuthorization','PrivateEndpointCount')
+    '13_ExpiringSecretsCerts.csv'      = @('Subscription','Vault','Name','Type','Expires','DaysLeft')
+    '13_PolicyNonCompliant.csv'        = @('Subscription','PolicyName','NonCompliantCount')
+    '13_PolicyAssignments.csv'         = @('Subscription','Name','DisplayName','Scope','EnforcementMode','PolicyDefinitionId','Id')
+    '13_DefenderRecommendations.csv'   = @('Subscription','Recommendation','Severity','Category','ResourceId','ResourceName','ResourceType','AssessmentKey','StatusCause','StatusDescription','Remediation')
+    '14_AdvisorAll.csv'                = @('Subscription','Category','Impact','Problem','Solution','Resource','ResourceId','ImpactedField','RecommendationTypeId','AnnualSavings','MonthlySavings','SavingsCurrency','LastUpdated')
+    '14_AdvisorCost.csv'               = @('Subscription','Impact','Problem','Solution','Resource','ResourceId','ImpactedField','RecommendationTypeId','AnnualSavings','MonthlySavings','SavingsCurrency','LastUpdated')
+    '14_ConsumptionByService.csv'      = @('Subscription','Service','TotalCost30d')
+    '14_Reservations.csv'              = @('Subscription','DisplayName','SKU','Location','Quantity','ExpiryDate','Utilization','ReservationOrderId','ReservationId','AppliedScopeType','Scope','Term','ProvisioningState','ReservedResourceType','Utilization1d','Utilization7d','Utilization30d','UtilizationTrend')
+    '14_Budgets.csv'                   = @('Subscription','Name','Amount','TimeGrain','CurrentSpend','Currency')
+    '14_ActualCostByResource.csv'      = @('Subscription','Month','ResourceId','ResourceName','ResourceGroup','ResourceType','ServiceName','Cost','Currency')
+    '14_ActualCostByService.csv'       = @('Subscription','Month','ServiceName','Cost','Currency','ResourceCount')
+    '15_RecoveryVaults.csv'            = @('Subscription','Name','ResourceGroup','Location')
+    '15_BackupItems.csv'               = @('Subscription','Vault','VM','ProtectionStatus','LastBackup','LatestRecoveryPoint','ResourceGroup','ResourceId','ProtectionState','LastBackupStatus','PolicyName')
+    '15_UnprotectedVMs.csv'            = @('Subscription','VM','Status','ResourceGroup','ResourceId','PowerState')
+    '16_LogAnalyticsWorkspaces.csv'    = @('Subscription','Name','ResourceGroup','SKU','RetentionDays','DailyCapGB')
+    '16_DiagnosticSettings.csv'        = @('Subscription','Resource','Type','HasDiagnostics','Destinations')
+    '16_AlertRules.csv'                = @('Subscription','Name','ResourceGroup','Severity','Enabled','TargetResource','AlertType','Scopes','ActionGroupCount','ActionGroups','ResourceId')
+    '16_ActionGroups.csv'              = @('Subscription','Name','ResourceGroup','Enabled','EmailReceivers','SMSReceivers','WebhookReceivers','EmailReceiverCount','SmsReceiverCount','WebhookReceiverCount','TotalReceivers','ResourceId')
+    '17_TagCompliance.csv'             = @('Subscription','Resource','Type','MissingTags','ResourceGroup','ResourceId')
+    '17_ResourceLocks.csv'             = @('Subscription','Name','ResourceGroup','LockLevel','Resource','Notes','ResourceId')
+    '18_AutomationAccounts.csv'        = @('Subscription','Name','ResourceGroup','Location')
+    '18_ArcMachines.csv'               = @('Subscription','Name','ResourceGroup','OS','Status','AgentVersion','LastStatusChange')
+    '00_ExportManifest.csv'            = @('File','Rows','Status','Note')
+    '00_SectionErrors.csv'             = @('Subscription','Section','Context','Dataset','Error')
+    '00_SectionTimings.csv'            = @('Subscription','Section','Seconds')
+}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXPORT ALL DATA
@@ -1485,6 +2504,9 @@ Export-SafeCsv $allRBAC                "12_RoleAssignments.csv"
 Export-SafeCsv ($allRBAC | Where-Object { $_.HighRisk -eq 'YES' }) "12_HighRiskRoles.csv"
 Export-SafeCsv $allCustomRoles         "12_CustomRoles.csv"
 Export-SafeCsv $allMgmtGroups          "12_ManagementGroups.csv"
+Export-SafeCsv $allGuestUsers          "12_GuestUsers.csv"
+Export-SafeCsv $allManagedIdentities   "12_ManagedIdentities.csv"
+Export-SafeCsv $allUserAssignedIds     "12_UserAssignedIdentities.csv"
 
 # Security
 Export-SafeCsv $allDefenderPricing     "13_DefenderPricing.csv"
@@ -1494,6 +2516,7 @@ Export-SafeCsv $allKeyVaults           "13_KeyVaults.csv"
 Export-SafeCsv $allExpiringSecrets     "13_ExpiringSecretsCerts.csv"
 Export-SafeCsv $allPolicyNonCompliant  "13_PolicyNonCompliant.csv"
 Export-SafeCsv $allPolicyAssignments   "13_PolicyAssignments.csv"
+Export-SafeCsv $allDefenderRecs        "13_DefenderRecommendations.csv"
 
 # Cost
 Export-SafeCsv $allAdvisorAll          "14_AdvisorAll.csv"
@@ -1501,6 +2524,8 @@ Export-SafeCsv $allAdvisorCost         "14_AdvisorCost.csv"
 Export-SafeCsv $allConsumption         "14_ConsumptionByService.csv"
 Export-SafeCsv $allReservations        "14_Reservations.csv"
 Export-SafeCsv $allBudgets             "14_Budgets.csv"
+Export-SafeCsv $allActualCostByResource "14_ActualCostByResource.csv"
+Export-SafeCsv $allActualCostByService  "14_ActualCostByService.csv"
 
 # Backup & DR
 Export-SafeCsv $allRecoveryVaults      "15_RecoveryVaults.csv"
@@ -1526,11 +2551,27 @@ Export-SafeCsv $allArcMachines         "18_ArcMachines.csv"
 # ═══════════════════════════════════════════════════════════════════════════════
 Write-Section "EXECUTIVE SUMMARY"
 
+$notCollectedCount = {
+    # Shows "Not collected" instead of a misleading 0 when the dataset could not be gathered
+    param([string]$File, $Count)
+    if ($Count -eq 0 -and $script:datasetNotes[$File]) { 'Not collected' } else { $Count }
+}
+$lastFullMonth = (Get-Date).AddMonths(-1).ToString('yyyy-MM')
+$lastMonthRows = @($allActualCostByService | Where-Object { $_.Month -eq $lastFullMonth })
+$lastMonthCost = if ($lastMonthRows.Count) {
+    ($lastMonthRows | Group-Object Currency | ForEach-Object {
+        '{0:N2} {1}' -f ($_.Group | Measure-Object -Property Cost -Sum).Sum, $_.Name
+    }) -join ' + '
+} elseif ($script:datasetNotes['14_ActualCostByService.csv']) { 'Not collected' } else { 'n/a' }
+
 $executiveSummary = [ordered]@{
     "Subscriptions Assessed"      = $subscriptions.Count
     "Total VMs"                   = @($allVMs).Count
     "Deallocated/Stopped VMs"     = @($allVMs | Where-Object { $_.PowerState -match 'stopped|deallocated' }).Count
-    "VMs Without Backup"          = @($allUnprotectedVMs).Count
+    "VMs Deallocated 90+ Days"    = @($allVMs | Where-Object { $_.DeallocatedOver90Days -eq $true }).Count
+    "VMs Using Hybrid Benefit"    = @($allVMs | Where-Object { $_.LicenseType -match 'Windows_Server|Windows_Client|RHEL_BYOS|SLES_BYOS' }).Count
+    "Windows VMs w/o Hybrid Benefit" = @($allVMs | Where-Object { $_.OsType -eq 'Windows' -and $_.LicenseType -notmatch 'Windows_Server|Windows_Client' }).Count
+    "VMs Without Backup"          = & $notCollectedCount '15_UnprotectedVMs.csv' @($allUnprotectedVMs).Count
     "VM Scale Sets"               = @($allVMSS).Count
     "Unattached Disks"            = @($allDisks | Where-Object { $_.AttachedTo -eq 'UNATTACHED' }).Count
     "Old Snapshots (>90d)"        = @($allSnapshots | Where-Object { $_.AgeDays -gt 90 }).Count
@@ -1541,6 +2582,7 @@ $executiveSummary = [ordered]@{
     "Azure Functions"             = @($allFunctions).Count
     "Logic Apps"                  = @($allLogicApps).Count
     "SQL Databases"               = @($allSQLDatabases).Count
+    "SQL Servers Open to Internet"= @($allSQLServers | Where-Object { $_.OpenToInternet -eq $true }).Count
     "SQL Managed Instances"       = @($allSQLManagedInst).Count
     "Cosmos DB Accounts"          = @($allCosmosDB).Count
     "Redis Caches"                = @($allRedisCache).Count
@@ -1548,12 +2590,23 @@ $executiveSummary = [ordered]@{
     "Container Apps"              = @($allContainerApps).Count
     "Container Registries"        = @($allContainerRegistries).Count
     "Key Vaults"                  = @($allKeyVaults).Count
+    "Key Vaults Public (Allow All)" = @($allKeyVaults | Where-Object { $_.PublicNetworkAccess -ne 'Disabled' -and $_.NetworkDefaultAction -eq 'Allow' -and -not $_.PrivateEndpointCount }).Count
+    "Storage Public (Allow All)"  = @($allStorageAccounts | Where-Object { $_.PublicNetworkAccess -ne 'Disabled' -and $_.NetworkDefaultAction -eq 'Allow' -and -not $_.PrivateEndpointCount }).Count
     "Expiring Secrets/Certs"      = @($allExpiringSecrets).Count
+    "Owner Assignments"           = & $notCollectedCount '12_RoleAssignments.csv' @($allRBAC | Where-Object { $_.IsOwner -eq $true }).Count
+    "Classic Administrators"      = & $notCollectedCount '12_RoleAssignments.csv' @($allRBAC | Where-Object { $_.IsClassicAdmin -eq $true }).Count
+    "Guest Users w/ Azure Roles"  = & $notCollectedCount '12_GuestUsers.csv' @($allGuestUsers | Where-Object { $_.HasAzureRoleAssignment -eq $true }).Count
+    "Defender High Severity Recs" = & $notCollectedCount '13_DefenderRecommendations.csv' @($allDefenderRecs | Where-Object { $_.Severity -eq 'High' }).Count
     "Advisor Cost Recommendations"= @($allAdvisorCost).Count
     "Security Alerts (Active)"    = @($allSecurityAlerts).Count
     "Policy Non-Compliant"        = @($allPolicyNonCompliant).Count
     "Resources Missing Tags"      = @($allTagCompliance).Count
     "Resources w/o Diagnostics"   = @($allDiagSettings | Where-Object { -not $_.HasDiagnostics }).Count
+    "Alert Rules w/o Action Groups" = @($allAlertRules | Where-Object { [int]$_.ActionGroupCount -eq 0 }).Count
+    "Action Groups w/o Receivers" = @($allActionGroups | Where-Object { [int]$_.TotalReceivers -eq 0 }).Count
+    "Reservations"                = & $notCollectedCount '14_Reservations.csv' @($allReservations).Count
+    "Reservations <80% Utilized (30d)" = @($allReservations | Where-Object { "$($_.Utilization30d)" -ne '' -and [double]$_.Utilization30d -lt 80 }).Count
+    "Actual Cost $lastFullMonth"  = $lastMonthCost
     "Azure Firewalls"             = @($allFirewalls).Count
     "Front Doors"                 = @($allFrontDoors).Count
     "Bastions"                    = @($allBastions).Count
@@ -1563,16 +2616,23 @@ $executiveSummary = [ordered]@{
     "Data Factories"              = @($allDataFactories).Count
     "Automation Accounts"         = @($allAutomationAccts).Count
     "Arc Connected Machines"      = @($allArcMachines).Count
+    "Datasets Not Collected"      = @($script:datasetNotes.Keys).Count
 }
 
 $executiveSummary.GetEnumerator() | ForEach-Object {
     $color = 'Green'
-    if ($_.Key -match 'Unattached|Orphaned|Critical|Without|Expiring|Missing|Non-Compliant|Alert|Empty|waste|w/o') {
-        if ($_.Value -gt 0) { $color = 'Red' }
+    if ("$($_.Value)" -eq 'Not collected') {
+        $color = 'DarkYellow'
+    } elseif ($_.Key -match 'Unattached|Orphaned|Critical|Without|w/o|Expiring|Missing|Non-Compliant|Alert|Empty|waste|90\+|Open to|Public|Owner|Classic|Guest|High Severity|<80%|Not Collected') {
+        if ($_.Value -is [int] -and $_.Value -gt 0) { $color = 'Red' }
     }
     Write-Host "  $($_.Key): $($_.Value)" -ForegroundColor $color
 }
-
+if ($script:datasetNotes.Count) {
+    Write-Host ""
+    Write-Host "  Not collected / partial (see 00_ExportManifest.csv):" -ForegroundColor DarkYellow
+    foreach ($k in ($script:datasetNotes.Keys | Sort-Object)) { Write-Host "    $k" -ForegroundColor DarkYellow }
+}
 # Export summary
 $executiveSummary.GetEnumerator() | ForEach-Object {
     [PSCustomObject]@{ Metric = $_.Key; Value = $_.Value }
@@ -1582,17 +2642,9 @@ Export-SafeCsv $summaryData "00_ExportManifest.csv"
 Export-SafeCsv $sectionErrors "00_SectionErrors.csv"
 Export-SafeCsv $sectionTimings "00_SectionTimings.csv"
 
-# Run summary JSON
-$runSummary = [ordered]@{
-    StartTime       = $startTime.ToString('o')
-    EndTime         = (Get-Date).ToString('o')
-    ElapsedMinutes  = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-    Subscriptions   = $subscriptions.Count
-    TotalErrors     = @($sectionErrors).Count
-    SectionTimings  = @($sectionTimings)
-    SectionErrors   = @($sectionErrors)
-}
-$runSummary | ConvertTo-Json -Depth 5 | Set-Content "$OutputPath/Assessment-RunSummary.json"
+# Run summary JSON (rewrites the startup copy with end time, timings, errors and not-collected datasets)
+Complete-SectionTiming
+Write-RunSummary -Final
 Write-Host "    ✓ Run summary → Assessment-RunSummary.json" -ForegroundColor Green
 
 # ═══════════════════════════════════════════════════════════════════════════════

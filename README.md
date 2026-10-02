@@ -51,7 +51,7 @@ Interactive menu that prepares the environment for accurate data collection. Run
 | Option | What It Does |
 |--------|-------------|
 | **[1]** Check posture | Read-only audit — shows which VMs have agents, which resources have diagnostics, what alert rules exist |
-| **[2]** Install modules | Installs all 23 required Az/Graph PowerShell modules |
+| **[2]** Install modules | Installs all 27 required Az/Graph PowerShell modules |
 | **[3]** Workspace | Creates or selects a Log Analytics workspace |
 | **[4]** Install AMA | Deploys Azure Monitor Agent to all VMs (enables system-assigned managed identity) |
 | **[5]** Data Collection Rules | Creates Windows + Linux perf counter DCRs (CPU, Memory, Disk, Network) and associates them with VMs |
@@ -93,6 +93,8 @@ Iterates all enabled subscriptions, collects 60+ CSVs across 19 categories, gene
 | `-OutputPath` | `./AzureAssessment_<timestamp>` | Output directory |
 | `-SkipMetrics` | `$false` | Skip CPU/memory metric collection (faster) |
 | `-DaysBack` | `30` | Lookback window for metrics |
+| `-CostMonths` | `3` | Full months of actual cost (Cost Management) to pull, plus month to date |
+| `-SectionTimeoutSeconds` | `300` | Time limit for long-running queries (Resource Graph, cost paging); on timeout the dataset is marked Partial and the run continues |
 
 ---
 
@@ -102,21 +104,21 @@ Iterates all enabled subscriptions, collects 60+ CSVs across 19 categories, gene
 |---|----------|------|-------------|
 | 00 | Subscriptions | Subscription list with offer/agreement type | EA, MCA, CSP, PAYG classification, spending limits |
 | 01 | Resource Inventory | Resource counts by type and location | Full resource map |
-| 02 | Compute | VMs, VM Metrics, VM Scale Sets | Stopped VMs still billing, right-sizing (CPU <5% = deallocate, <15% = downsize) |
+| 02 | Compute | VMs, VM Metrics, VM Scale Sets | Stopped VMs still billing, VMs deallocated 90+ days, Hybrid Benefit (`LicenseType`), encryption at host / disk encryption / ADE, right-sizing on CPU, memory and disk IOPS |
 | 03 | App Services | App Service Plans, Web Apps | Empty plans (pure waste), HTTPS/TLS config |
 | 04 | Functions | Azure Functions inventory | Runtime, plan, state |
 | 05 | Logic Apps | Logic Apps inventory | Workflow state |
 | 06 | Storage | Disks, Unattached Disks, Snapshots, Storage Accounts, File Shares | Orphaned disks, snapshots >90 days, public blob access, missing lifecycle policies |
 | 07 | Networking | VNets, Public IPs, NSG Rules, LBs, App Gateways, Firewalls, Front Door, Bastion, NAT GW, VPN/ER, Peerings, Private Endpoints, DNS, CDN, Network Watchers | Orphaned public IPs, CRITICAL NSG rules (RDP/SSH/SQL open to internet) |
-| 08 | Databases | SQL Servers, SQL DBs, SQL Managed Instances, Cosmos DB, MySQL, PostgreSQL, Redis | DTU usage, zone redundancy, non-SSL ports |
+| 08 | Databases | SQL Servers, SQL DBs, SQL Managed Instances, Cosmos DB, MySQL, PostgreSQL, Redis | Entra-only auth, public network access, open firewall ranges, auditing, TDE, zone redundancy, non-SSL ports |
 | 09 | Messaging | Service Bus, Event Hubs, API Management | SKU and namespace inventory |
 | 10 | Containers | AKS Clusters, Node Pools, Container Instances, Container Apps, Container Registries | K8s version, autoscale config, admin-enabled ACRs |
 | 11 | Data & Analytics | Data Factories | Pipeline inventory |
-| 12 | Identity & RBAC | Role Assignments, High-Risk Roles, Custom Roles, Management Groups | Owner/Contributor sprawl, service principal assignments |
-| 13 | Security | Defender Pricing, Secure Score, Alerts, Key Vaults, Expiring Secrets/Certs, Policy Compliance | Defender plan gaps, active alerts, secrets expiring <30 days |
-| 14 | Cost | Advisor (All + Cost), Consumption by Service, Reservations, Budgets | Right-sizing recs, RI utilization, spend by service |
+| 12 | Identity & RBAC | Role Assignments (incl. classic admins), High-Risk Roles, Custom Roles, Management Groups, Guest Users, Managed Identities, User-Assigned Identities | Owner/Contributor sprawl, classic admins, guests with Azure roles, orphaned assignments |
+| 13 | Security | Defender Pricing, Secure Score, Alerts, Defender Recommendations (unhealthy), Key Vaults, Expiring Secrets/Certs, Policy Compliance, Policy Assignments | Defender plan gaps, what to fix, Key Vault network exposure, secrets expiring <30 days |
+| 14 | Cost | Advisor (All + Cost), Consumption by Service, Actual Cost by Resource / by Service, Reservations, Budgets | Right-sizing recs with savings, RI utilization, actual monthly spend by resource and service |
 | 15 | Backup & DR | Recovery Vaults, Backup Items, Unprotected VMs | VMs with no backup configured |
-| 16 | Monitoring | Log Analytics Workspaces, Diagnostic Settings, Alert Rules, Action Groups | Resources invisible to monitoring, unconfigured action groups |
+| 16 | Monitoring | Log Analytics Workspaces, Diagnostic Settings, Alert Rules (metric, log, activity log, smart detector), Action Groups | Resources invisible to monitoring, alert rules with no action group, action groups with no receivers |
 | 17 | Governance | Tag Compliance, Resource Locks | Missing required tags (Environment, Owner, CostCenter, Application) |
 | 18 | Automation & Hybrid | Automation Accounts, Arc Connected Machines | Agent status, OS inventory |
 | 19 | Management Groups | Hierarchy | Tenant structure |
@@ -129,7 +131,10 @@ Iterates all enabled subscriptions, collects 60+ CSVs across 19 categories, gene
 AzureAssessment_20260320-1430/
 ├── Subscriptions.csv               ← Subscription list with offer type (EA/MCA/CSP/PAYG)
 ├── 00_ExecutiveSummary.csv         ← Red/green metrics at a glance
-├── 00_ExportManifest.csv           ← Which files have data and row counts
+├── 00_ExportManifest.csv           ← File, Rows, Status, Note for every dataset
+├── 00_SectionErrors.csv            ← Every error, with the section and dataset it affected
+├── 00_SectionTimings.csv           ← Seconds spent per section
+├── Assessment-RunSummary.json      ← StartTime, script version, Az module versions, account type
 ├── 02_VMs.csv
 ├── 02_VM_Metrics.csv
 ├── 06_UnattachedDisks.csv
@@ -140,6 +145,12 @@ AzureAssessment_20260320-1430/
 ├── ... (60+ CSVs total)
 └── AzureAssessment_20260320-1430.zip   ← Everything bundled
 ```
+
+### Output contract
+
+- **Column names are stable.** New columns are only ever appended; existing ones are never renamed. The analyzer keys on them.
+- **Empty vs not collected.** A section that ran and found nothing writes a header-only CSV (`Status = Empty`). A section that failed or lacked permission writes no file and is listed in the manifest with `Status = NotCollected` and the reason in `Note`. `Partial` means some subscriptions or pages failed.
+- **`Assessment-RunSummary.json`** is written at startup and rewritten at the end with `StartTime`, `EndTime`, `ScriptVersion`, `PowerShell`, `AzModuleVersions`, `AccountType` (User / ServicePrincipal / ManagedService), `Subscriptions`, `MissingModules`, `NotCollected` datasets, `SectionTimings` and `TotalErrors`.
 
 ### Downloading from Azure Cloud Shell
 
@@ -174,6 +185,9 @@ The assessment script is entirely read-only — it never creates, modifies, or d
 | **Key Vault Reader** or Access Policy `List` | Each Key Vault | Secrets and certificates approaching expiry (Section 13) | The script calls `Get-AzKeyVaultSecret` and `Get-AzKeyVaultCertificate` on every vault to identify secrets and certificates expiring within 30/60/90 days. Key Vault has its own access control plane — subscription Reader can list vaults but cannot read their contents. You need either the Key Vault Reader RBAC role (if using RBAC authorization) or a Key Vault access policy granting `List` permission for secrets and certificates. |
 | **Monitoring Reader** | All target subscriptions | VM CPU/memory metrics, diagnostic settings, alert rules, and action groups (Sections 02, 08, 16) | `Get-AzMetric` retrieves CPU percentage (and DTU for SQL) over the configured lookback window to identify idle, underutilized, and right-sizing candidates. `Get-AzDiagnosticSetting` checks whether each resource is sending logs/metrics to Log Analytics. `Get-AzMetricAlertRuleV2` and `Get-AzActionGroup` audit your alerting coverage. These Monitor APIs require Monitoring Reader — standard Reader cannot query metric data or alert configurations. |
 | **Billing Reader** | Subscription or Enrollment | Cost breakdown by service, budgets, and reservation utilization (Section 14) | `Get-AzConsumptionUsageDetail` pulls the last 30 days of spend grouped by service to show where money is going. `Get-AzConsumptionBudget` lists configured budgets and their thresholds. `Get-AzReservation` checks RI utilization so you can spot underused reservations. Consumption and billing APIs are access-controlled separately from resource data — without Billing Reader, Section 14 (Cost) is skipped entirely. |
+| **Cost Management Reader** | All target subscriptions | Actual cost by resource and service (Section 14) | `Microsoft.CostManagement/query` returns ActualCost grouped by resource and service for the last `-CostMonths` months. CSP subscriptions without a partner-enabled cost view may return 401; the manifest then marks `14_ActualCost*` as NotCollected. |
+| **Reservations Reader** *(tenant-level)* | Tenant | Reservation inventory and utilization (Section 14) | Reservations live under `Microsoft.Capacity`, not under subscriptions, so subscription Reader does not see them. Assign at `/providers/Microsoft.Capacity` or have a reservation administrator grant Reader on each reservation order. |
+| **Directory read** *(default member permission)* | Tenant | Guest user list (`12_GuestUsers.csv`) | `Get-AzADUser -Filter "userType eq 'Guest'"`. Members can read the directory by default; guests or tenants with restricted directory access need **Directory Readers**. |
 | **Directory Reader** *(Entra ID role)* | Tenant | *Optional* — Entra ID users, Conditional Access policies, app registrations, and license counts | Only needed if you run the Microsoft Graph sections. The script uses `Get-MgUser`, `Get-MgIdentityConditionalAccessPolicy`, and `Get-MgApplication` to audit identity posture. This is an Entra ID directory role (not an Azure RBAC role) and must be assigned in the Entra admin center. If skipped, all other assessment sections still run normally. |
 
 > **Shortcut:** The built-in **Reader** + **Security Reader** + **Monitoring Reader** + **Billing Reader** roles at subscription scope cover everything except Key Vault secrets and Entra ID. For a quick engagement, request **Reader** at the management group root and add the others at subscription scope.
