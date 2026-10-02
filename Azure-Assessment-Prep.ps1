@@ -28,44 +28,44 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 
 function Show-Banner {
     Clear-Host
     Write-Host ""
-    Write-Host "  ╔═══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "  ║     Azure Assessment Prep & Monitoring Enablement            ║" -ForegroundColor Cyan
-    Write-Host "  ║     Centre Technologies                                      ║" -ForegroundColor Cyan
-    Write-Host "  ╚═══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "  +===============================================================+" -ForegroundColor Cyan
+    Write-Host "  |     Azure Assessment Prep & Monitoring Enablement            |" -ForegroundColor Cyan
+    Write-Host "  |     Centre Technologies                                      |" -ForegroundColor Cyan
+    Write-Host "  +===============================================================+" -ForegroundColor Cyan
     Write-Host ""
 }
 
 function Show-Menu {
-    Write-Host "  ┌─────────────────────────────────────────────────────────────┐" -ForegroundColor White
-    Write-Host "  │  PREP & PREREQUISITES                                       │" -ForegroundColor White
-    Write-Host "  │                                                             │" -ForegroundColor White
-    Write-Host "  │   [1]  Check current monitoring posture (read-only)         │" -ForegroundColor White
-    Write-Host "  │   [2]  Install required PowerShell modules                  │" -ForegroundColor White
-    Write-Host "  │   [3]  Create / Select Log Analytics Workspace              │" -ForegroundColor White
-    Write-Host "  │                                                             │" -ForegroundColor White
-    Write-Host "  │  MONITORING ENABLEMENT                                      │" -ForegroundColor White
-    Write-Host "  │                                                             │" -ForegroundColor White
-    Write-Host "  │   [4]  Install Azure Monitor Agent on all VMs               │" -ForegroundColor White
-    Write-Host "  │   [5]  Create Data Collection Rules (CPU, Memory, Disk)     │" -ForegroundColor White
-    Write-Host "  │   [6]  Enable Diagnostic Settings on key resources          │" -ForegroundColor White
-    Write-Host "  │   [7]  Enable VM Insights (performance + dependency maps)   │" -ForegroundColor White
-    Write-Host "  │   [8]  Register resource providers for monitoring           │" -ForegroundColor White
-    Write-Host "  │                                                             │" -ForegroundColor White
-    Write-Host "  │  QUICK ACTIONS                                              │" -ForegroundColor White
-    Write-Host "  │                                                             │" -ForegroundColor White
-    Write-Host "  │   [A]  Run ALL prep steps (3-8) - Full automated setup      │" -ForegroundColor Yellow
-    Write-Host "  │   [S]  Show subscription selector                           │" -ForegroundColor White
-    Write-Host "  │   [R]  Generate readiness report                            │" -ForegroundColor White
-    Write-Host "  │   [Q]  Quit                                                 │" -ForegroundColor White
-    Write-Host "  │                                                             │" -ForegroundColor White
-    Write-Host "  └─────────────────────────────────────────────────────────────┘" -ForegroundColor White
+    Write-Host "  +-------------------------------------------------------------+" -ForegroundColor White
+    Write-Host "  |  PREP & PREREQUISITES                                       |" -ForegroundColor White
+    Write-Host "  |                                                             |" -ForegroundColor White
+    Write-Host "  |   [1]  Check current monitoring posture (read-only)         |" -ForegroundColor White
+    Write-Host "  |   [2]  Install required PowerShell modules                  |" -ForegroundColor White
+    Write-Host "  |   [3]  Create / Select Log Analytics Workspace              |" -ForegroundColor White
+    Write-Host "  |                                                             |" -ForegroundColor White
+    Write-Host "  |  MONITORING ENABLEMENT                                      |" -ForegroundColor White
+    Write-Host "  |                                                             |" -ForegroundColor White
+    Write-Host "  |   [4]  Install Azure Monitor Agent on all VMs               |" -ForegroundColor White
+    Write-Host "  |   [5]  Create Data Collection Rules (CPU, Memory, Disk)     |" -ForegroundColor White
+    Write-Host "  |   [6]  Enable Diagnostic Settings on key resources          |" -ForegroundColor White
+    Write-Host "  |   [7]  Enable VM Insights (performance + dependency maps)   |" -ForegroundColor White
+    Write-Host "  |   [8]  Register resource providers for monitoring           |" -ForegroundColor White
+    Write-Host "  |                                                             |" -ForegroundColor White
+    Write-Host "  |  QUICK ACTIONS                                              |" -ForegroundColor White
+    Write-Host "  |                                                             |" -ForegroundColor White
+    Write-Host "  |   [A]  Run ALL prep steps (3-8) - Full automated setup      |" -ForegroundColor Yellow
+    Write-Host "  |   [S]  Show subscription selector                           |" -ForegroundColor White
+    Write-Host "  |   [R]  Generate readiness report                            |" -ForegroundColor White
+    Write-Host "  |   [Q]  Quit                                                 |" -ForegroundColor White
+    Write-Host "  |                                                             |" -ForegroundColor White
+    Write-Host "  +-------------------------------------------------------------+" -ForegroundColor White
     Write-Host ""
 }
 
@@ -110,7 +110,7 @@ function Get-OrCreateWorkspace {
 
     # Create new workspace
     Write-Host ""
-    Write-Host "  ═══ CREATE NEW LOG ANALYTICS WORKSPACE ═══" -ForegroundColor Cyan
+    Write-Host "  === CREATE NEW LOG ANALYTICS WORKSPACE ===" -ForegroundColor Cyan
     $wsName = if ($LogAnalyticsWorkspaceName) { $LogAnalyticsWorkspaceName }
               else { Read-Host "  Workspace name (e.g., law-assessment-prod)" }
     if (-not $wsName) {
@@ -148,22 +148,22 @@ function Get-OrCreateWorkspace {
     return $script:WorkspaceId
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # MENU FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 
 function Invoke-Option1_CheckPosture {
-    Write-Host "`n  ═══ MONITORING POSTURE CHECK ═══" -ForegroundColor Cyan
+    Write-Host "`n  === MONITORING POSTURE CHECK ===" -ForegroundColor Cyan
 
     # Log Analytics Workspaces
     Write-Host "`n  Log Analytics Workspaces:" -ForegroundColor Yellow
     $workspaces = Get-AzOperationalInsightsWorkspace -ErrorAction SilentlyContinue
     if ($workspaces) {
         $workspaces | ForEach-Object {
-            Write-Host "    ✓ $($_.Name) | Retention: $($_.RetentionInDays)d | SKU: $($_.Sku)" -ForegroundColor Green
+            Write-Host "    + $($_.Name) | Retention: $($_.RetentionInDays)d | SKU: $($_.Sku)" -ForegroundColor Green
         }
     } else {
-        Write-Host "    ✗ No Log Analytics workspaces found" -ForegroundColor Red
+        Write-Host "    x No Log Analytics workspaces found" -ForegroundColor Red
     }
 
     # VM Monitoring Agent Status
@@ -176,13 +176,13 @@ function Invoke-Option1_CheckPosture {
         $hasMMA = $extensions | Where-Object { $_.ExtensionType -match 'MicrosoftMonitoringAgent|OmsAgentForLinux' }
         if ($hasAMA) {
             $amaCount++
-            Write-Host "    ✓ $($vm.Name) - Azure Monitor Agent" -ForegroundColor Green
+            Write-Host "    + $($vm.Name) - Azure Monitor Agent" -ForegroundColor Green
         } elseif ($hasMMA) {
-            Write-Host "    ⚠ $($vm.Name) - Legacy MMA/OMS (consider upgrading to AMA)" -ForegroundColor Yellow
+            Write-Host "    ! $($vm.Name) - Legacy MMA/OMS (consider upgrading to AMA)" -ForegroundColor Yellow
             $amaCount++
         } else {
             $noAgentCount++
-            Write-Host "    ✗ $($vm.Name) - NO monitoring agent" -ForegroundColor Red
+            Write-Host "    x $($vm.Name) - NO monitoring agent" -ForegroundColor Red
         }
     }
     Write-Host "`n  Summary: $amaCount/$(@($vms).Count) VMs have monitoring agents, $noAgentCount without" -ForegroundColor Cyan
@@ -212,9 +212,9 @@ function Invoke-Option1_CheckPosture {
     try {
         $dcrs = Get-AzResource -ResourceType 'Microsoft.Insights/dataCollectionRules' -ErrorAction SilentlyContinue
         if ($dcrs) {
-            $dcrs | ForEach-Object { Write-Host "    ✓ $($_.Name) ($($_.ResourceGroupName))" -ForegroundColor Green }
+            $dcrs | ForEach-Object { Write-Host "    + $($_.Name) ($($_.ResourceGroupName))" -ForegroundColor Green }
         } else {
-            Write-Host "    ✗ No Data Collection Rules found" -ForegroundColor Red
+            Write-Host "    x No Data Collection Rules found" -ForegroundColor Red
         }
     } catch {
         Write-Host "    ? Could not query DCRs" -ForegroundColor DarkYellow
@@ -232,17 +232,17 @@ function Invoke-Option1_CheckPosture {
     $ags = Get-AzActionGroup -ErrorAction SilentlyContinue
     if ($ags) {
         $ags | ForEach-Object {
-            Write-Host "    ✓ $($_.Name) - Email: $($_.EmailReceivers.Count), SMS: $($_.SmsReceivers.Count)" -ForegroundColor Green
+            Write-Host "    + $($_.Name) - Email: $($_.EmailReceivers.Count), SMS: $($_.SmsReceivers.Count)" -ForegroundColor Green
         }
     } else {
-        Write-Host "    ✗ No Action Groups configured" -ForegroundColor Red
+        Write-Host "    x No Action Groups configured" -ForegroundColor Red
     }
 
     Write-Host "`n  Posture check complete." -ForegroundColor Cyan
 }
 
 function Invoke-Option2_InstallModules {
-    Write-Host "`n  ═══ INSTALLING REQUIRED MODULES ═══" -ForegroundColor Cyan
+    Write-Host "`n  === INSTALLING REQUIRED MODULES ===" -ForegroundColor Cyan
 
     $modules = @(
         'Az.Accounts',
@@ -278,14 +278,14 @@ function Invoke-Option2_InstallModules {
     foreach ($mod in $modules) {
         $installed = Get-Module -ListAvailable -Name $mod 2>$null
         if ($installed) {
-            Write-Host "    ✓ $mod ($($installed[0].Version))" -ForegroundColor Green
+            Write-Host "    + $mod ($($installed[0].Version))" -ForegroundColor Green
         } else {
             Write-Host "    Installing $mod..." -ForegroundColor Yellow
             try {
                 Install-Module -Name $mod -Scope CurrentUser -AllowClobber -Force -ErrorAction Stop
-                Write-Host "    ✓ $mod installed" -ForegroundColor Green
+                Write-Host "    + $mod installed" -ForegroundColor Green
             } catch {
-                Write-Host "    ✗ Failed to install $mod : $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "    x Failed to install $mod : $($_.Exception.Message)" -ForegroundColor Red
             }
         }
     }
@@ -293,19 +293,19 @@ function Invoke-Option2_InstallModules {
 }
 
 function Invoke-Option3_Workspace {
-    Write-Host "`n  ═══ LOG ANALYTICS WORKSPACE SETUP ═══" -ForegroundColor Cyan
+    Write-Host "`n  === LOG ANALYTICS WORKSPACE SETUP ===" -ForegroundColor Cyan
     Get-OrCreateWorkspace | Out-Null
     if ($script:WorkspaceId) {
         Write-Host "`n  Workspace ready: $script:WorkspaceName ($script:WorkspaceId)" -ForegroundColor Green
     } else {
-        Write-Host "`n  ⚠ No workspace selected. Other steps requiring a workspace will be skipped." -ForegroundColor Yellow
+        Write-Host "`n  ! No workspace selected. Other steps requiring a workspace will be skipped." -ForegroundColor Yellow
     }
 }
 
 function Invoke-Option4_InstallAMA {
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    Write-Host "`n  ═══ INSTALL AZURE MONITOR AGENT ON ALL VMs ═══" -ForegroundColor Cyan
+    Write-Host "`n  === INSTALL AZURE MONITOR AGENT ON ALL VMs ===" -ForegroundColor Cyan
 
     $vms = Get-AzVM -ErrorAction SilentlyContinue
     if (-not $vms) {
@@ -369,7 +369,7 @@ function Invoke-Option4_InstallAMA {
                 -EnableAutomaticUpgrade $true `
                 -ErrorAction SilentlyContinue | Out-Null
         }
-        Write-Host "    ✓ AMA extension deployed" -ForegroundColor Green
+        Write-Host "    + AMA extension deployed" -ForegroundColor Green
     }
     Write-Host "`n  AMA installation complete. Agents may take a few minutes to initialize." -ForegroundColor Cyan
 }
@@ -377,7 +377,7 @@ function Invoke-Option4_InstallAMA {
 function Invoke-Option5_CreateDCR {
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    Write-Host "`n  ═══ CREATE DATA COLLECTION RULES ═══" -ForegroundColor Cyan
+    Write-Host "`n  === CREATE DATA COLLECTION RULES ===" -ForegroundColor Cyan
 
     $wsId = Get-OrCreateWorkspace
     if (-not $wsId) { Write-Host "  Workspace required. Aborting." -ForegroundColor Red; return }
@@ -434,10 +434,10 @@ function Invoke-Option5_CreateDCR {
         $token = (Get-AzAccessToken -ResourceUrl "https://management.azure.com").Token
         $headers = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
         Invoke-RestMethod -Uri $uri -Method Put -Headers $headers -Body $winDcrBody -ErrorAction Stop | Out-Null
-        Write-Host "  ✓ Created: $winDcrName" -ForegroundColor Green
+        Write-Host "  + Created: $winDcrName" -ForegroundColor Green
         $script:WinDcrId = "/subscriptions/$subId/resourceGroups/$script:WorkspaceRG/providers/Microsoft.Insights/dataCollectionRules/$winDcrName"
     } catch {
-        Write-Host "  ⚠ Could not create Windows DCR: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  ! Could not create Windows DCR: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 
     # Linux DCR
@@ -485,10 +485,10 @@ function Invoke-Option5_CreateDCR {
     try {
         $uri = "https://management.azure.com/subscriptions/$subId/resourceGroups/$script:WorkspaceRG/providers/Microsoft.Insights/dataCollectionRules/${linDcrName}?api-version=2022-06-01"
         Invoke-RestMethod -Uri $uri -Method Put -Headers $headers -Body $linDcrBody -ErrorAction Stop | Out-Null
-        Write-Host "  ✓ Created: $linDcrName" -ForegroundColor Green
+        Write-Host "  + Created: $linDcrName" -ForegroundColor Green
         $script:LinDcrId = "/subscriptions/$subId/resourceGroups/$script:WorkspaceRG/providers/Microsoft.Insights/dataCollectionRules/$linDcrName"
     } catch {
-        Write-Host "  ⚠ Could not create Linux DCR: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  ! Could not create Linux DCR: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 
     # Associate DCRs with VMs
@@ -510,9 +510,9 @@ function Invoke-Option5_CreateDCR {
                 }
             } | ConvertTo-Json
             Invoke-RestMethod -Uri $assocUri -Method Put -Headers $headers -Body $assocBody -ErrorAction Stop | Out-Null
-            Write-Host "    ✓ $($vm.Name) → $($osType) DCR" -ForegroundColor Green
+            Write-Host "    + $($vm.Name) -> $($osType) DCR" -ForegroundColor Green
         } catch {
-            Write-Host "    ⚠ $($vm.Name): $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "    ! $($vm.Name): $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
     Write-Host "`n  DCR setup complete. Metrics will start flowing within 5-10 minutes." -ForegroundColor Cyan
@@ -521,7 +521,7 @@ function Invoke-Option5_CreateDCR {
 function Invoke-Option6_DiagnosticSettings {
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    Write-Host "`n  ═══ ENABLE DIAGNOSTIC SETTINGS ═══" -ForegroundColor Cyan
+    Write-Host "`n  === ENABLE DIAGNOSTIC SETTINGS ===" -ForegroundColor Cyan
 
     $wsId = Get-OrCreateWorkspace
     if (-not $wsId) { Write-Host "  Workspace required. Aborting." -ForegroundColor Red; return }
@@ -592,10 +592,10 @@ function Invoke-Option6_DiagnosticSettings {
             if ($metricSettings.Count -gt 0) { $params['Metric'] = $metricSettings }
 
             New-AzDiagnosticSetting @params -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
-            Write-Host "    ✓ $($res.Name) ($($res.ResourceType.Split('/')[-1]))" -ForegroundColor Green
+            Write-Host "    + $($res.Name) ($($res.ResourceType.Split('/')[-1]))" -ForegroundColor Green
             $successCount++
         } catch {
-            Write-Host "    ✗ $($res.Name): $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "    x $($res.Name): $($_.Exception.Message)" -ForegroundColor Red
             $failCount++
         }
     }
@@ -605,7 +605,7 @@ function Invoke-Option6_DiagnosticSettings {
 function Invoke-Option7_VMInsights {
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    Write-Host "`n  ═══ ENABLE VM INSIGHTS ═══" -ForegroundColor Cyan
+    Write-Host "`n  === ENABLE VM INSIGHTS ===" -ForegroundColor Cyan
 
     $wsId = Get-OrCreateWorkspace
     if (-not $wsId) { Write-Host "  Workspace required. Aborting." -ForegroundColor Red; return }
@@ -647,9 +647,9 @@ function Invoke-Option7_VMInsights {
                 -Location $vm.Location `
                 -EnableAutomaticUpgrade $true `
                 -ErrorAction Stop | Out-Null
-            Write-Host "    ✓ $($vm.Name)" -ForegroundColor Green
+            Write-Host "    + $($vm.Name)" -ForegroundColor Green
         } catch {
-            Write-Host "    ✗ $($vm.Name): $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "    x $($vm.Name): $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 
@@ -674,9 +674,9 @@ function Invoke-Option7_VMInsights {
             -IntelligencePackName 'VMInsights' `
             -Enabled $true `
             -ErrorAction SilentlyContinue | Out-Null
-        Write-Host "  ✓ VMInsights solution enabled" -ForegroundColor Green
+        Write-Host "  + VMInsights solution enabled" -ForegroundColor Green
     } catch {
-        Write-Host "  ⚠ Could not enable VMInsights solution (may need manual activation in Portal)" -ForegroundColor Yellow
+        Write-Host "  ! Could not enable VMInsights solution (may need manual activation in Portal)" -ForegroundColor Yellow
     }
 
     Write-Host "`n  VM Insights setup complete." -ForegroundColor Cyan
@@ -685,7 +685,7 @@ function Invoke-Option7_VMInsights {
 function Invoke-Option8_RegisterProviders {
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    Write-Host "`n  ═══ REGISTER RESOURCE PROVIDERS ═══" -ForegroundColor Cyan
+    Write-Host "`n  === REGISTER RESOURCE PROVIDERS ===" -ForegroundColor Cyan
 
     $providers = @(
         'Microsoft.Insights',
@@ -702,25 +702,25 @@ function Invoke-Option8_RegisterProviders {
         $reg = Get-AzResourceProvider -ProviderNamespace $provider -ErrorAction SilentlyContinue
         $state = $reg.RegistrationState | Select-Object -First 1
         if ($state -eq 'Registered') {
-            Write-Host "    ✓ $provider (already registered)" -ForegroundColor Green
+            Write-Host "    + $provider (already registered)" -ForegroundColor Green
         } else {
             Write-Host "    Registering $provider..." -ForegroundColor Yellow
             if ($PSCmdlet.ShouldProcess($provider, "Register resource provider")) {
                 Register-AzResourceProvider -ProviderNamespace $provider -ErrorAction SilentlyContinue | Out-Null
             }
-            Write-Host "    ✓ $provider (registration initiated)" -ForegroundColor Green
+            Write-Host "    + $provider (registration initiated)" -ForegroundColor Green
         }
     }
     Write-Host "`n  Provider registration complete. Some may take a few minutes to fully register." -ForegroundColor Cyan
 }
 
 function Invoke-OptionS_SelectSubscription {
-    Write-Host "`n  ═══ SUBSCRIPTION SELECTOR ═══" -ForegroundColor Cyan
+    Write-Host "`n  === SUBSCRIPTION SELECTOR ===" -ForegroundColor Cyan
     $subs = Get-AzSubscription | Where-Object { $_.State -eq 'Enabled' }
     $i = 0
     foreach ($s in $subs) {
         $i++
-        $current = if ($s.Id -eq (Get-AzContext).Subscription.Id) { " ← CURRENT" } else { "" }
+        $current = if ($s.Id -eq (Get-AzContext).Subscription.Id) { " <- CURRENT" } else { "" }
         Write-Host "    [$i] $($s.Name) ($($s.Id))$current" -ForegroundColor White
     }
     Write-Host ""
@@ -733,7 +733,7 @@ function Invoke-OptionS_SelectSubscription {
 }
 
 function Invoke-OptionR_ReadinessReport {
-    Write-Host "`n  ═══ ASSESSMENT READINESS REPORT ═══" -ForegroundColor Cyan
+    Write-Host "`n  === ASSESSMENT READINESS REPORT ===" -ForegroundColor Cyan
 
     $report = [System.Collections.ArrayList]::new()
     $ctx = Get-AzContext
@@ -807,30 +807,30 @@ function Invoke-OptionR_ReadinessReport {
     })
 
     Write-Host ""
-    Write-Host "  ┌────────────────────────────────────────────────────────────────────────────────────┐" -ForegroundColor White
-    Write-Host "  │  READINESS REPORT - $($ctx.Subscription.Name)" -ForegroundColor White
-    Write-Host "  ├────────────────────────────────────────────────────────────────────────────────────┤" -ForegroundColor White
+    Write-Host "  +------------------------------------------------------------------------------------+" -ForegroundColor White
+    Write-Host "  |  READINESS REPORT - $($ctx.Subscription.Name)" -ForegroundColor White
+    Write-Host "  +------------------------------------------------------------------------------------+" -ForegroundColor White
     foreach ($item in $report) {
         $color = if ($item.Status -match '^PASS') { 'Green' } elseif ($item.Status -match '^WARN') { 'Yellow' } else { 'Red' }
-        Write-Host "  │  $($item.Check.PadRight(30)) $($item.Status)" -ForegroundColor $color
+        Write-Host "  |  $($item.Check.PadRight(30)) $($item.Status)" -ForegroundColor $color
         if ($item.Action -ne 'None') {
-            Write-Host "  │  $(' ' * 30) → $($item.Action)" -ForegroundColor DarkYellow
+            Write-Host "  |  $(' ' * 30) -> $($item.Action)" -ForegroundColor DarkYellow
         }
     }
-    Write-Host "  └────────────────────────────────────────────────────────────────────────────────────┘" -ForegroundColor White
+    Write-Host "  +------------------------------------------------------------------------------------+" -ForegroundColor White
 
     $allPass = ($report | Where-Object { $_.Status -match '^PASS' }).Count -eq $report.Count
     if ($allPass) {
-        Write-Host "`n  ✓ Environment is READY for assessment!" -ForegroundColor Green
+        Write-Host "`n  + Environment is READY for assessment!" -ForegroundColor Green
         Write-Host "    Run: .\Azure-Assessment-Complete.ps1" -ForegroundColor Cyan
     } else {
-        Write-Host "`n  ⚠ Some items need attention before assessment." -ForegroundColor Yellow
+        Write-Host "`n  ! Some items need attention before assessment." -ForegroundColor Yellow
         Write-Host "    Ideally enable monitoring 7-14 days before running the assessment." -ForegroundColor Yellow
     }
 }
 
 function Invoke-OptionA_RunAll {
-    Write-Host "`n  ═══ FULL AUTOMATED PREP ═══" -ForegroundColor Cyan
+    Write-Host "`n  === FULL AUTOMATED PREP ===" -ForegroundColor Cyan
     Write-Host "  This will run all prep steps (3-8) in sequence." -ForegroundColor Yellow
     Write-Host "  Steps:" -ForegroundColor White
     Write-Host "    1. Create/Select Log Analytics Workspace" -ForegroundColor White
@@ -849,26 +849,26 @@ function Invoke-OptionA_RunAll {
     Invoke-Option6_DiagnosticSettings
     Invoke-Option7_VMInsights
 
-    Write-Host "`n  ═══════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "`n  ===========================================================" -ForegroundColor Green
     Write-Host "  FULL PREP COMPLETE" -ForegroundColor Green
-    Write-Host "  ═══════════════════════════════════════════════════════════" -ForegroundColor Green
+    Write-Host "  ===========================================================" -ForegroundColor Green
     Write-Host "  Next steps:" -ForegroundColor Yellow
     Write-Host "    1. Wait 7-14 days for metrics to accumulate" -ForegroundColor White
     Write-Host "    2. Run: .\Azure-Assessment-Complete.ps1" -ForegroundColor Cyan
     Write-Host "    3. Review CSV output for findings" -ForegroundColor White
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # MAIN LOOP
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 
 # Auth check
 $ctx = Get-AzContext
 if (-not $ctx) {
     Write-Host "  Not authenticated. Running Connect-AzAccount..." -ForegroundColor Yellow
-    try { Connect-AzAccount -ErrorAction Stop | Out-Null } catch { Write-Host "  ✗ Authentication failed: $($_.Exception.Message)" -ForegroundColor Red; return }
+    try { Connect-AzAccount -ErrorAction Stop | Out-Null } catch { Write-Host "  x Authentication failed: $($_.Exception.Message)" -ForegroundColor Red; return }
     $ctx = Get-AzContext
-    if (-not $ctx) { Write-Host "  ✗ Authentication was cancelled or failed. Exiting." -ForegroundColor Red; return }
+    if (-not $ctx) { Write-Host "  x Authentication was cancelled or failed. Exiting." -ForegroundColor Red; return }
 }
 
 if ($SubscriptionId) {

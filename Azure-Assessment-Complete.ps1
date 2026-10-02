@@ -47,7 +47,7 @@ param(
     [int]$SectionTimeoutSeconds = 300
 )
 
-#region ── Setup ──────────────────────────────────────────────────────────────
+#region -- Setup --------------------------------------------------------------
 $ScriptVersion = '2026.10.0'
 $ErrorActionPreference = 'Continue'
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmm'
@@ -101,14 +101,14 @@ function Write-Section {
     Complete-SectionTiming
     $script:currentSection = $Title
     $script:sectionStart   = Get-Date
-    Write-Host "`n╔══════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "║  $Title" -ForegroundColor Cyan
-    Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host "`n+==============================================================+" -ForegroundColor Cyan
+    Write-Host "|  $Title" -ForegroundColor Cyan
+    Write-Host "+==============================================================+" -ForegroundColor Cyan
 }
 
 function Write-SubSection {
     param([string]$Title)
-    Write-Host "  ► $Title" -ForegroundColor Yellow
+    Write-Host "  > $Title" -ForegroundColor Yellow
 }
 
 function Write-SectionError {
@@ -147,10 +147,10 @@ function Export-SafeCsv {
         }
         $rows | Export-Csv $path -NoTypeInformation -Encoding UTF8
         $status = if ($note) { 'Partial' } else { 'Collected' }
-        Write-Host "    ✓ Exported $count rows → $FileName" -ForegroundColor Green
+        Write-Host "    + Exported $count rows -> $FileName" -ForegroundColor Green
     } elseif ($note) {
         $status = 'NotCollected'
-        Write-Host "    ✗ Not collected: $FileName ($note)" -ForegroundColor DarkYellow
+        Write-Host "    x Not collected: $FileName ($note)" -ForegroundColor DarkYellow
     } else {
         $status = 'Empty'
         if ($Columns) {
@@ -399,7 +399,7 @@ if ($missingModules.Count -gt 0) {
 }
 #endregion
 
-#region ── Authentication Check ───────────────────────────────────────────────
+#region -- Authentication Check -----------------------------------------------
 Write-Section "0. Authentication & Subscription Selection"
 $ctx = Get-AzContext
 if (-not $ctx) {
@@ -408,7 +408,7 @@ if (-not $ctx) {
     $ctx = Get-AzContext
 }
 if (-not $ctx) {
-    Write-Host "  ✗ Azure authentication failed or was cancelled. Run Connect-AzAccount and retry." -ForegroundColor Red
+    Write-Host "  x Azure authentication failed or was cancelled. Run Connect-AzAccount and retry." -ForegroundColor Red
     try { Stop-Transcript | Out-Null } catch {}
     return
 }
@@ -460,7 +460,7 @@ if ($SubscriptionExclude) {
 }
 Write-Host "  Subscriptions to assess: $($subscriptions.Count)" -ForegroundColor Green
 if (@($subscriptions).Count -eq 0) {
-    Write-Host "  ✗ No subscriptions matched the selection criteria. Nothing to assess." -ForegroundColor Red
+    Write-Host "  x No subscriptions matched the selection criteria. Nothing to assess." -ForegroundColor Red
     try { Stop-Transcript | Out-Null } catch {}
     return
 }
@@ -496,9 +496,9 @@ $subscriptions | ForEach-Object {
 #endregion
 Write-RunSummary
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # COLLECTION ARRAYS - Accumulate across all subscriptions
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 $allActualCostByResource = [System.Collections.ArrayList]::new()
 $allActualCostByService  = [System.Collections.ArrayList]::new()
 $allGuestUsers         = [System.Collections.ArrayList]::new()
@@ -585,18 +585,18 @@ $allReservations       = [System.Collections.ArrayList]::new()
 $allMgmtGroups         = [System.Collections.ArrayList]::new()
 $allFileShares         = [System.Collections.ArrayList]::new()
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # ITERATE SUBSCRIPTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 foreach ($sub in $subscriptions) {
-    Write-Host "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor White
+    Write-Host "`n-------------------------------------------------------------" -ForegroundColor White
     Write-Host "  SUBSCRIPTION: $($sub.Name) ($($sub.Id))" -ForegroundColor White
-    Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor White
+    Write-Host "-------------------------------------------------------------" -ForegroundColor White
     Set-AzContext -SubscriptionId $sub.Id | Out-Null
     $subName = $sub.Name
     $script:currentSubName = $sub.Name
 
-    #region ── 1. Resource Inventory ──────────────────────────────────────────
+    #region -- 1. Resource Inventory ------------------------------------------
     Write-Section "1. Resource Inventory"
     $resources = Get-AzResource
     $resources | Group-Object ResourceType |
@@ -611,7 +611,7 @@ foreach ($sub in $subscriptions) {
     Write-Host "    Total resources: $($resources.Count)" -ForegroundColor Green
     #endregion
 
-    #region ── 2. Compute: Virtual Machines ───────────────────────────────────
+    #region -- 2. Compute: Virtual Machines -----------------------------------
     Write-Section "2. Compute: Virtual Machines"
     Write-SubSection "VM Inventory & Status"
     $vms = @(Get-AzVM -Status -ErrorAction SilentlyContinue)
@@ -815,7 +815,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ }
     #endregion
 
-    #region ── 3. App Services ────────────────────────────────────────────────
+    #region -- 3. App Services ------------------------------------------------
     Write-Section "3. App Service Plans & Web Apps"
     Write-SubSection "App Service Plans"
     $plans = Get-AzAppServicePlan -ErrorAction SilentlyContinue
@@ -862,7 +862,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ -Context 'Get-AzWebApp' -Dataset '03_WebApps.csv' }
     #endregion
 
-    #region ── 4. Azure Functions ──────────────────────────────────────────────
+    #region -- 4. Azure Functions ----------------------------------------------
     Write-Section "4. Azure Functions"
     try {
         Get-AzResource -ResourceType 'Microsoft.Web/sites' -ErrorAction Stop |
@@ -886,7 +886,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ -Dataset '04_Functions.csv' }
     #endregion
 
-    #region ── 5. Logic Apps ──────────────────────────────────────────────────
+    #region -- 5. Logic Apps --------------------------------------------------
     Write-Section "5. Logic Apps"
     try {
         Get-AzResource -ResourceType 'Microsoft.Logic/workflows' -ExpandProperties -ErrorAction Stop | ForEach-Object {
@@ -902,7 +902,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ -Dataset '05_LogicApps.csv' }
     #endregion
 
-    #region ── 6. Storage ─────────────────────────────────────────────────────
+    #region -- 6. Storage -----------------------------------------------------
     Write-Section "6. Storage Assessment"
     Write-SubSection "Managed Disks"
     foreach ($disk in $subDisks) {
@@ -990,7 +990,7 @@ foreach ($sub in $subscriptions) {
     }
     #endregion
 
-    #region ── 7. Networking ──────────────────────────────────────────────────
+    #region -- 7. Networking --------------------------------------------------
     Write-Section "7. Networking"
     Write-SubSection "Virtual Networks & Subnets"
     Get-AzVirtualNetwork -ErrorAction SilentlyContinue | ForEach-Object {
@@ -1268,7 +1268,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ }
     #endregion
 
-    #region ── 8. Database Services ───────────────────────────────────────────
+    #region -- 8. Database Services -------------------------------------------
     Write-Section "8. Database Services"
     Write-SubSection "Azure SQL"
     try {
@@ -1438,7 +1438,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ }
     #endregion
 
-    #region ── 9. Messaging & Integration ─────────────────────────────────────
+    #region -- 9. Messaging & Integration -------------------------------------
     Write-Section "9. Messaging & Integration"
     Write-SubSection "Service Bus"
     try {
@@ -1480,7 +1480,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ }
     #endregion
 
-    #region ── 10. Containers ─────────────────────────────────────────────────
+    #region -- 10. Containers -------------------------------------------------
     Write-Section "10. Containers"
     Write-SubSection "AKS Clusters"
     try {
@@ -1558,7 +1558,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ }
     #endregion
 
-    #region ── 11. Data & Analytics ───────────────────────────────────────────
+    #region -- 11. Data & Analytics -------------------------------------------
     Write-Section "11. Data & Analytics"
     Write-SubSection "Data Factories"
     try {
@@ -1573,7 +1573,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ }
     #endregion
 
-    #region ── 12. Identity & RBAC ────────────────────────────────────────────
+    #region -- 12. Identity & RBAC --------------------------------------------
     Write-Section "12. Identity & RBAC"
     Write-SubSection "Role Assignments (incl. classic administrators)"
     try {
@@ -1620,7 +1620,7 @@ foreach ($sub in $subscriptions) {
     }
     #endregion
 
-    #region ── 13. Security & Compliance ──────────────────────────────────────
+    #region -- 13. Security & Compliance --------------------------------------
     Write-Section "13. Security & Compliance"
     Write-SubSection "Defender for Cloud"
     try {
@@ -1740,7 +1740,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ -Dataset '13_PolicyAssignments.csv' }
     #endregion
 
-    #region ── 14. Cost & Advisor ─────────────────────────────────────────────
+    #region -- 14. Cost & Advisor ---------------------------------------------
     Write-Section "14. Cost Optimization & Advisor"
     Write-SubSection "Advisor Recommendations"
     try {
@@ -1884,7 +1884,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ }
     #endregion
 
-    #region ── 15. Backup & DR ────────────────────────────────────────────────
+    #region -- 15. Backup & DR ------------------------------------------------
     Write-Section "15. Backup & Disaster Recovery"
     Write-SubSection "Recovery Services Vaults & Backup Items"
     if (-not (Test-CommandAvailable 'Get-AzRecoveryServicesBackupItem')) {
@@ -1940,7 +1940,7 @@ foreach ($sub in $subscriptions) {
     # Unprotected VMs are computed after all subscriptions are processed
     #endregion
 
-    #region ── 16. Monitoring ─────────────────────────────────────────────────
+    #region -- 16. Monitoring -------------------------------------------------
     Write-Section "16. Monitoring & Log Analytics"
     Write-SubSection "Log Analytics Workspaces"
     Get-AzResource -ResourceType 'Microsoft.OperationalInsights/workspaces' -ErrorAction SilentlyContinue | ForEach-Object {
@@ -2066,7 +2066,7 @@ foreach ($sub in $subscriptions) {
         }
     } catch { Write-SectionError $_ -Dataset '16_ActionGroups.csv' }
     #endregion
-    #region ── 17. Governance & Tags ──────────────────────────────────────────
+    #region -- 17. Governance & Tags ------------------------------------------
     Write-Section "17. Governance & Tagging"
     Write-SubSection "Tag Compliance"
     $requiredTags = @('Environment', 'Owner', 'CostCenter', 'Application')
@@ -2103,7 +2103,7 @@ foreach ($sub in $subscriptions) {
     } catch { Write-SectionError $_ -Dataset '17_ResourceLocks.csv' }
     #endregion
 
-    #region ── 18. Automation & Hybrid ────────────────────────────────────────
+    #region -- 18. Automation & Hybrid ----------------------------------------
     Write-Section "18. Automation & Hybrid"
     Write-SubSection "Automation Accounts"
     try {
@@ -2145,9 +2145,9 @@ $subIds = @($subscriptions | ForEach-Object { $_.Id })
 $subNameById = @{}
 foreach ($s in $subscriptions) { $subNameById["$($s.Id)".ToLower()] = $s.Name }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # MANAGEMENT GROUPS (tenant-level, outside sub loop)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 Write-Section "19. Management Groups"
 try {
     Get-AzManagementGroup -ErrorAction SilentlyContinue | ForEach-Object {
@@ -2159,9 +2159,9 @@ try {
     }
 } catch { Write-SectionError $_ }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # TENANT-LEVEL / CROSS-SUBSCRIPTION COLLECTION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 Write-Section "20. Reservations"
 # Reservations live at tenant (billing) scope, not under a subscription
 try {
@@ -2434,9 +2434,9 @@ $Schemas = @{
     '00_SectionTimings.csv'            = @('Subscription','Section','Seconds')
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # EXPORT ALL DATA
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 Write-Section "EXPORTING ALL DATA"
 
 # Core Infrastructure
@@ -2546,9 +2546,9 @@ Export-SafeCsv $allResourceLocks       "17_ResourceLocks.csv"
 Export-SafeCsv $allAutomationAccts     "18_AutomationAccounts.csv"
 Export-SafeCsv $allArcMachines         "18_ArcMachines.csv"
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # EXECUTIVE SUMMARY
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 Write-Section "EXECUTIVE SUMMARY"
 
 $notCollectedCount = {
@@ -2645,11 +2645,11 @@ Export-SafeCsv $sectionTimings "00_SectionTimings.csv"
 # Run summary JSON (rewrites the startup copy with end time, timings, errors and not-collected datasets)
 Complete-SectionTiming
 Write-RunSummary -Final
-Write-Host "    ✓ Run summary → Assessment-RunSummary.json" -ForegroundColor Green
+Write-Host "    + Run summary -> Assessment-RunSummary.json" -ForegroundColor Green
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # BUNDLE INTO ZIP
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 Write-Section "PACKAGING RESULTS"
 
 $csvFiles = Get-ChildItem $OutputPath -Filter *.csv
@@ -2669,36 +2669,36 @@ try {
     )
 
     $zipSize = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
-    Write-Host "  ✓ Zipped $($csvFiles.Count) CSVs → $zipPath ($zipSize MB)" -ForegroundColor Green
+    Write-Host "  + Zipped $($csvFiles.Count) CSVs -> $zipPath ($zipSize MB)" -ForegroundColor Green
 } catch {
     # Fallback: try Compress-Archive (PS 5.1+)
     try {
         Compress-Archive -Path "$OutputPath/*" -DestinationPath $zipPath -Force
         $zipSize = [math]::Round((Get-Item $zipPath).Length / 1MB, 2)
-        Write-Host "  ✓ Zipped $($csvFiles.Count) CSVs → $zipPath ($zipSize MB)" -ForegroundColor Green
+        Write-Host "  + Zipped $($csvFiles.Count) CSVs -> $zipPath ($zipSize MB)" -ForegroundColor Green
     } catch {
-        Write-Host "  ⚠ Could not create zip. CSVs are still available in: $OutputPath" -ForegroundColor Yellow
+        Write-Host "  ! Could not create zip. CSVs are still available in: $OutputPath" -ForegroundColor Yellow
         Write-Host "    To zip manually: Compress-Archive -Path '$OutputPath/*' -DestinationPath '$zipPath'" -ForegroundColor DarkYellow
     }
 }
 
 $elapsed = (Get-Date) - $startTime
-Write-Host "`n═══════════════════════════════════════════════════════════════" -ForegroundColor Green
+Write-Host "`n===============================================================" -ForegroundColor Green
 Write-Host "  ASSESSMENT COMPLETE" -ForegroundColor Green
 Write-Host "  Output directory: $OutputPath" -ForegroundColor Green
 Write-Host "  Zip package:      $zipPath" -ForegroundColor Green
 Write-Host "  Total CSV files:  $($csvFiles.Count)" -ForegroundColor Green
 Write-Host "  Elapsed time:     $($elapsed.ToString('hh\:mm\:ss'))" -ForegroundColor Green
-Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Green
+Write-Host "===============================================================" -ForegroundColor Green
 Get-ChildItem $OutputPath -Filter *.csv | Sort-Object Name | Format-Table Name, @{N='SizeKB';E={[math]::Round($_.Length/1KB,1)}} -AutoSize
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 # DOWNLOAD OPTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ===============================================================================
 Write-Host ""
-Write-Host "  ┌─────────────────────────────────────────────────────────────┐" -ForegroundColor Cyan
-Write-Host "  │  HOW TO DOWNLOAD                                            │" -ForegroundColor Cyan
-Write-Host "  └─────────────────────────────────────────────────────────────┘" -ForegroundColor Cyan
+Write-Host "  +-------------------------------------------------------------+" -ForegroundColor Cyan
+Write-Host "  |  HOW TO DOWNLOAD                                            |" -ForegroundColor Cyan
+Write-Host "  +-------------------------------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
 
 # Detect if running in Azure Cloud Shell
@@ -2709,16 +2709,16 @@ if ($isCloudShell) {
     $homeZip = Join-Path $HOME (Split-Path $zipPath -Leaf)
     Copy-Item $zipPath $homeZip -Force -ErrorAction SilentlyContinue
 
-    Write-Host "  OPTION 1 — Cloud Shell built-in download (easiest)" -ForegroundColor Yellow
+    Write-Host "  OPTION 1 - Cloud Shell built-in download (easiest)" -ForegroundColor Yellow
     Write-Host "    Run this command:" -ForegroundColor White
     Write-Host "    download $homeZip" -ForegroundColor Green
     Write-Host ""
-    Write-Host "  OPTION 2 — Cloud Shell file browser" -ForegroundColor Yellow
+    Write-Host "  OPTION 2 - Cloud Shell file browser" -ForegroundColor Yellow
     Write-Host "    Click the file-browser icon (page icon) in the Cloud Shell toolbar" -ForegroundColor White
     Write-Host "    Navigate to: $(Split-Path $homeZip -Leaf)" -ForegroundColor White
-    Write-Host "    Right-click → Download" -ForegroundColor White
+    Write-Host "    Right-click -> Download" -ForegroundColor White
     Write-Host ""
-    Write-Host "  OPTION 3 — Upload to Storage Account + SAS link" -ForegroundColor Yellow
+    Write-Host "  OPTION 3 - Upload to Storage Account + SAS link" -ForegroundColor Yellow
     Write-Host "    (Useful for sharing with team or if file > 1GB)" -ForegroundColor White
     Write-Host @"
     `$ctx = (Get-AzStorageAccount -ResourceGroupName '<rg>' -Name '<storageacct>').Context
@@ -2728,7 +2728,7 @@ if ($isCloudShell) {
         -Permission r -ExpiryTime (Get-Date).AddHours(24) -FullUri
 "@ -ForegroundColor DarkGray
 } else {
-    Write-Host "  Local terminal detected — zip is already on disk:" -ForegroundColor Yellow
+    Write-Host "  Local terminal detected - zip is already on disk:" -ForegroundColor Yellow
     $resolvedZip = (Resolve-Path $zipPath -ErrorAction SilentlyContinue)
     Write-Host "    $(if ($resolvedZip) { $resolvedZip.Path } else { $zipPath })" -ForegroundColor Green
     Write-Host ""
